@@ -1,0 +1,690 @@
+// =============================================================================
+// FileSync — Distributed File-Sharing & Replicated Storage System
+// =============================================================================
+//
+// Protocol Buffers v3 service definition for the FileSync distributed system.
+//
+// This proto file defines ALL gRPC services and messages required for:
+//   1. File Operations      — Upload, Download, Delete, ListFiles
+//   2. Snapshot Management   — CreateSnapshot, ListSnapshots, ReadSnapshot
+//   3. Leader Election       — Heartbeat, Election, ElectionVictory (Bully Algorithm)
+//   4. Mutual Exclusion      — ForwardWrite (Centralized Server approach)
+//   5. Replication           — ReplicateFile (async master → follower replication)
+//   6. Checkpointing         — CheckpointRequest (Koo-Toueg inspired coordination)
+//
+// Physical Architecture:
+//   - 4 independent nodes on a LAN (~10ms RTT)
+//   - Tolerates 1 node failure
+//   - Master elected via Bully Algorithm (300ms heartbeat timeout, 85ms convergence)
+//
+// Author: FileSync Team
+// =============================================================================
+
+syntax = "proto3";
+
+package filesync;
+
+// Go package output path — generated code lands in gen/filesync/
+option go_package = "github.com/filesync/gen/filesync";
+
+// =============================================================================
+// SERVICE DEFINITION
+// =============================================================================
+//
+// The FileSyncService consolidates all RPCs into a single gRPC service.
+// Every node in the cluster exposes this service on the configured listen port.
+// The master node handles write coordination; all nodes serve reads.
+// =============================================================================
+
+service FileSyncService {
+
+  // ---------------------------------------------------------------------------
+  // FILE OPERATIONS
+  // ---------------------------------------------------------------------------
+
+  // Upload streams file data from the client to the receiving node.
+  // If the receiving node is a follower, it forwards the write request to the
+  // master via ForwardWrite. The master serializes the write through its
+  // centralized lock, persists via WAL, and triggers async replication.
+  //
+  // Flow: Client → Node → (if follower) ForwardWrite → Master → WAL → Replicate
+  //
+  // Timing: Logs upload duration including WAL append and replication latency.
+  rpc Upload(stream UploadRequest) returns (UploadResponse);
+
+  // Download streams file data back to the requesting client.
+  // Any node holding a replica can serve the download — no master coordination
+  // required for read operations.
+  //
+  // Timing: Logs time-to-first-byte and total transfer duration.
+  rpc Download(DownloadRequest) returns (stream DownloadResponse);
+
+  // Delete removes a file from the cluster. Write operation — follows the same
+  // centralized mutex path as Upload (follower → master forwarding).
+  // The master appends a DELETE entry to the WAL before removing file data.
+  //
+  // Timing: Logs delete coordination latency across nodes.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // ListFiles returns metadata for all files currently stored in the cluster.
+  // Read-only — can be served by any node from its local file index.
+  //
+  // Timing: Logs index scan duration.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // ---------------------------------------------------------------------------
+  // SNAPSHOT MANAGEMENT
+  // ---------------------------------------------------------------------------
+
+  // CreateSnapshot initiates an atomic, coordinated snapshot across ALL 4 nodes.
+  // Only the master can initiate this. It assigns a snapshot ID, broadcasts
+  // SnapshotInit to all followers, waits for ACKs, and then finalizes the
+  // snapshot with an immutable copy of the file index + WAL position.
+  //
+  // Timing: Logs total snapshot coordination time (broadcast → all ACKs).
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+  // ListSnapshots returns metadata for all available snapshots on this node.
+  // Read-only operation.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // ReadSnapshot retrieves the metadata contents of a specific snapshot by ID.
+  // Returns the immutable file index state captured at snapshot time.
+  rpc ReadSnapshot(ReadSnapshotRequest) returns (ReadSnapshotResponse);
+
+  // SnapshotInit is called by the master on each follower during CreateSnapshot.
+  // The follower flushes its local state to disk and replies with an ACK.
+  // This is part of the coordinated snapshot protocol.
+  rpc SnapshotInit(SnapshotInitRequest) returns (SnapshotInitResponse);
+
+  // ---------------------------------------------------------------------------
+  // LEADER ELECTION (Bully Algorithm)
+  // ---------------------------------------------------------------------------
+
+  // Heartbeat is sent periodically by the master to all followers.
+  // Followers use this to detect master liveness. If no heartbeat is received
+  // within 300ms, the follower initiates a Bully election.
+  //
+  // Timing: Logs heartbeat RTT for network health monitoring.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Election is called by a node initiating a Bully election.
+  // Sent to all nodes with HIGHER IDs. If a higher-ID node responds with
+  // alive=true, the initiator backs off. If no higher-ID node responds
+  // within the election timeout (85ms target), the initiator declares victory.
+  //
+  // Timing: Logs election initiation timestamp and response latency.
+  rpc Election(ElectionRequest) returns (ElectionResponse);
+
+  // ElectionVictory is broadcast by the winning node to ALL other nodes
+  // to announce itself as the new master. All receivers update their masterID.
+  //
+  // Timing: Logs victory propagation time across the cluster.
+  rpc ElectionVictory(VictoryRequest) returns (VictoryResponse);
+
+  // ---------------------------------------------------------------------------
+  // MUTUAL EXCLUSION (Centralized Server)
+  // ---------------------------------------------------------------------------
+
+  // ForwardWrite is called by follower nodes to forward write operations
+  // (Upload/Delete) to the current master. The master acquires its centralized
+  // write lock, processes the operation atomically (single-threaded serialization),
+  // appends to WAL, and returns the result.
+  //
+  // This ensures all write operations across the cluster are serialized through
+  // a single point, preventing concurrent write conflicts.
+  //
+  // Timing: Logs lock acquisition time, WAL append time, total forwarding latency.
+  rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+
+  // ---------------------------------------------------------------------------
+  // REPLICATION (Async Master → Follower)
+  // ---------------------------------------------------------------------------
+
+  // ReplicateFile is called by the master to push file data and metadata to
+  // follower nodes after a successful write. Replication is asynchronous —
+  // the master does not block the client response on replication completion.
+  // Target: replicate to 1-2 followers based on replication_factor in config.
+  //
+  // Timing: Logs replication transfer time and bytes transferred per follower.
+  rpc ReplicateFile(stream ReplicateRequest) returns (ReplicateResponse);
+
+  // ---------------------------------------------------------------------------
+  // COORDINATED CHECKPOINTING (Koo-Toueg Inspired)
+  // ---------------------------------------------------------------------------
+
+  // CheckpointRequest is sent by the master to ALL follower nodes to initiate
+  // a coordinated checkpoint. The master assigns a unique checkpoint_id and
+  // broadcasts this request. Each follower:
+  //   1. Flushes dirty metadata to disk
+  //   2. Records the current WAL position
+  //   3. Replies with an ACK
+  //
+  // The master BLOCKS until all 4 nodes (including itself) have acknowledged.
+  // This ensures a globally consistent checkpoint across the cluster.
+  //
+  // Timing: Logs per-node ACK latency and total checkpoint coordination time.
+  rpc CheckpointRequest(CheckpointReq) returns (CheckpointAck);
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — FILE OPERATIONS
+// =============================================================================
+
+// UploadRequest streams file content in chunks from client → node.
+// The first message in the stream MUST contain file metadata (filename, etc.).
+// Subsequent messages carry raw byte chunks of the file data.
+message UploadRequest {
+  // Metadata for the file being uploaded. Only set in the FIRST message
+  // of the stream. Ignored in subsequent chunk messages.
+  FileMetadataProto metadata = 1;
+
+  // Raw byte chunk of the file content. Each chunk should be sized
+  // appropriately for network efficiency (recommended: 64KB-1MB chunks).
+  bytes chunk_data = 2;
+
+  // The originating node ID — used for tracking which node initiated
+  // the upload (relevant when requests are forwarded to master).
+  int32 source_node_id = 3;
+}
+
+// UploadResponse confirms the result of the upload operation.
+message UploadResponse {
+  // Whether the upload was successfully persisted and WAL-logged.
+  bool success = 1;
+
+  // Human-readable status message (e.g., "File uploaded successfully",
+  // "Write forwarded to master node 4").
+  string message = 2;
+
+  // The version number assigned to this file after upload.
+  // Monotonically increasing per-file version counter.
+  int64 version = 3;
+
+  // Server-side processing duration in milliseconds.
+  // Includes: WAL append + disk write + lock acquisition time.
+  int64 processing_time_ms = 4;
+}
+
+// DownloadRequest identifies which file to download.
+message DownloadRequest {
+  // The exact filename to download. Must match a filename in the file index.
+  string filename = 1;
+
+  // Optional: specific version to download. If 0, returns the latest version.
+  int64 version = 2;
+
+  // The node ID of the requesting client — used for logging and metrics.
+  int32 requesting_node_id = 3;
+}
+
+// DownloadResponse streams file data back to the client in chunks.
+message DownloadResponse {
+  // File metadata — only populated in the FIRST message of the response stream.
+  // Allows the client to know the total size, checksum, etc. before receiving data.
+  FileMetadataProto metadata = 1;
+
+  // Raw byte chunk of the file content.
+  bytes chunk_data = 2;
+
+  // Total number of bytes remaining after this chunk (for progress tracking).
+  int64 bytes_remaining = 3;
+}
+
+// DeleteRequest specifies which file to delete from the cluster.
+message DeleteRequest {
+  // The filename to delete. Must exist in the file index.
+  string filename = 1;
+
+  // The node ID initiating the delete — used for write forwarding logic.
+  int32 source_node_id = 2;
+}
+
+// DeleteResponse confirms the result of the delete operation.
+message DeleteResponse {
+  // Whether the delete was successfully executed and WAL-logged.
+  bool success = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // Server-side processing duration in milliseconds.
+  int64 processing_time_ms = 3;
+}
+
+// ListFilesRequest is intentionally minimal — lists ALL files.
+// Future extension: add optional filters (prefix, regex, etc.).
+message ListFilesRequest {
+  // The node ID making the request — for logging purposes.
+  int32 requesting_node_id = 1;
+}
+
+// ListFilesResponse returns the complete file index.
+message ListFilesResponse {
+  // All file metadata entries currently tracked by this node.
+  repeated FileMetadataProto files = 1;
+
+  // Total number of files in the index.
+  int32 total_count = 2;
+
+  // Server-side query duration in milliseconds.
+  int64 query_time_ms = 3;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — FILE METADATA & WAL
+// =============================================================================
+
+// FileMetadataProto is the protobuf representation of the FileMetadata struct.
+// Tracks all essential metadata for a file in the distributed index.
+message FileMetadataProto {
+  // The unique filename (acts as the primary key in the file index).
+  string filename = 1;
+
+  // Monotonically increasing version number. Incremented on each upload
+  // that overwrites this filename. Starts at 1.
+  int64 version = 2;
+
+  // File size in bytes.
+  int64 size = 3;
+
+  // SHA-256 checksum of the file content — used for integrity verification
+  // during replication and download.
+  string checksum = 4;
+
+  // List of node IDs that hold replicas of this file.
+  // Length should match the replication_factor from config.
+  repeated int32 replicas = 5;
+
+  // Unix timestamp (nanoseconds) when this file was first uploaded.
+  int64 created_at = 6;
+
+  // Unix timestamp (nanoseconds) of the last modification (re-upload).
+  int64 updated_at = 7;
+}
+
+// WALEntryProto is the protobuf representation of a Write-Ahead Log entry.
+// Every mutating operation (Upload, Delete) is logged BEFORE execution.
+message WALEntryProto {
+  // The type of operation: "UPLOAD" or "DELETE".
+  string operation = 1;
+
+  // The filename affected by this operation.
+  string filename = 2;
+
+  // The file version at the time of this operation.
+  int64 version = 3;
+
+  // Unix timestamp (nanoseconds) when the WAL entry was created.
+  int64 timestamp = 4;
+
+  // Whether this operation has been committed (fully persisted + replicated).
+  // Used during recovery to identify operations that need replay.
+  bool committed = 5;
+
+  // Unique entry ID for ordering and deduplication during WAL replay.
+  int64 entry_id = 6;
+
+  // The checkpoint ID this entry belongs to (0 if not yet checkpointed).
+  // Used to determine which entries to replay after loading a checkpoint.
+  int64 checkpoint_id = 7;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — LEADER ELECTION (Bully Algorithm)
+// =============================================================================
+
+// HeartbeatRequest is sent periodically by the master to all followers.
+// Followers use the absence of heartbeats (>300ms) to trigger elections.
+message HeartbeatRequest {
+  // The node ID of the master sending the heartbeat.
+  int32 master_id = 1;
+
+  // Unix timestamp (nanoseconds) when the heartbeat was sent.
+  // Used to measure RTT and detect clock skew.
+  int64 timestamp = 2;
+
+  // The master's current term/epoch — monotonically increasing.
+  // Prevents stale heartbeats from old masters being accepted.
+  int64 term = 3;
+}
+
+// HeartbeatResponse acknowledges receipt of the heartbeat.
+message HeartbeatResponse {
+  // The node ID of the follower acknowledging the heartbeat.
+  int32 node_id = 1;
+
+  // Unix timestamp (nanoseconds) of the acknowledgement.
+  // Master uses (ack_timestamp - send_timestamp) to track RTT.
+  int64 ack_timestamp = 2;
+
+  // Whether this follower considers the sender as the legitimate master.
+  bool acknowledged = 3;
+}
+
+// ElectionRequest is sent by a node initiating a Bully election.
+// Per the Bully Algorithm, this is only sent to nodes with HIGHER IDs.
+message ElectionRequest {
+  // The node ID of the candidate initiating the election.
+  int32 candidate_id = 1;
+
+  // The election term being proposed. Used to disambiguate concurrent elections.
+  int64 term = 2;
+
+  // Unix timestamp (nanoseconds) when the election was initiated.
+  // Used to enforce the 85ms convergence time target.
+  int64 initiated_at = 3;
+}
+
+// ElectionResponse from a higher-ID node.
+// If alive=true, the requesting candidate must yield (a higher node exists).
+message ElectionResponse {
+  // The node ID of the responder.
+  int32 responder_id = 1;
+
+  // If true, this higher-ID node is alive and will take over the election.
+  // The original candidate should back off.
+  bool alive = 2;
+
+  // The responder's current term for consistency checks.
+  int64 term = 3;
+}
+
+// VictoryRequest is broadcast by the election winner to ALL nodes.
+// Every receiver updates its masterID to the winner.
+message VictoryRequest {
+  // The node ID of the new master.
+  int32 new_master_id = 1;
+
+  // The term/epoch of this new master's reign.
+  int64 term = 2;
+
+  // Unix timestamp (nanoseconds) when victory was declared.
+  // Followers can use this to measure election convergence time.
+  int64 declared_at = 3;
+}
+
+// VictoryResponse acknowledges the new master.
+message VictoryResponse {
+  // The node ID acknowledging the new master.
+  int32 node_id = 1;
+
+  // Whether the node accepts this master (should always be true unless
+  // a concurrent election is in progress with a higher term).
+  bool accepted = 2;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — MUTUAL EXCLUSION (ForwardWrite)
+// =============================================================================
+
+// ForwardWriteRequest encapsulates a write operation forwarded from a
+// follower to the master for centralized serialization.
+message ForwardWriteRequest {
+  // The type of write operation: "UPLOAD" or "DELETE".
+  string operation = 1;
+
+  // The filename being written/deleted.
+  string filename = 2;
+
+  // The file data — only populated for UPLOAD operations.
+  // For large files, this contains the complete file content.
+  // (For streaming large files, consider chunking at a higher level.)
+  bytes file_data = 3;
+
+  // The node ID that originated this write request.
+  int32 source_node_id = 4;
+
+  // File metadata for the operation (size, checksum, etc.).
+  // Only populated for UPLOAD operations.
+  FileMetadataProto metadata = 5;
+
+  // Unix timestamp (nanoseconds) when the follower created this request.
+  // Used to measure end-to-end write forwarding latency.
+  int64 forwarded_at = 6;
+}
+
+// ForwardWriteResponse returns the result of the centralized write.
+message ForwardWriteResponse {
+  // Whether the master successfully processed the write.
+  bool success = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // The version assigned by the master (for uploads).
+  int64 version = 3;
+
+  // Total time the master spent processing this write (lock acquisition +
+  // WAL append + disk write) in milliseconds.
+  int64 processing_time_ms = 4;
+
+  // Time spent waiting to acquire the centralized write lock, in milliseconds.
+  // Useful for diagnosing contention issues.
+  int64 lock_wait_time_ms = 5;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — REPLICATION
+// =============================================================================
+
+// ReplicateRequest streams file data from the master to a follower replica.
+// First message contains metadata; subsequent messages carry data chunks.
+message ReplicateRequest {
+  // File metadata — only set in the FIRST message of the stream.
+  FileMetadataProto metadata = 1;
+
+  // Raw byte chunk of the file content.
+  bytes chunk_data = 2;
+
+  // The operation type: "UPLOAD" or "DELETE".
+  // For DELETE, no chunk_data is sent — the follower just removes the file.
+  string operation = 3;
+
+  // The WAL entry ID associated with this replication — the follower
+  // should log this for consistency tracking.
+  int64 wal_entry_id = 4;
+}
+
+// ReplicateResponse confirms replication status on the follower.
+message ReplicateResponse {
+  // Whether the follower successfully persisted the replicated data.
+  bool success = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // The follower's node ID (for master's replication tracking).
+  int32 node_id = 3;
+
+  // Time taken by the follower to persist the replica, in milliseconds.
+  int64 replication_time_ms = 4;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — COORDINATED CHECKPOINTING (Koo-Toueg Inspired)
+// =============================================================================
+
+// CheckpointReq is sent by the master to each follower to initiate a
+// coordinated checkpoint. Per the Koo-Toueg inspired protocol:
+//   1. Master assigns a globally unique checkpoint_id
+//   2. Master broadcasts CheckpointReq to all followers
+//   3. Each follower flushes dirty metadata to disk
+//   4. Each follower records its current WAL position
+//   5. Each follower replies with CheckpointAck
+//   6. Master blocks until ALL 4 nodes have acknowledged
+message CheckpointReq {
+  // Globally unique checkpoint identifier assigned by the master.
+  int64 checkpoint_id = 1;
+
+  // The master's node ID (for verification).
+  int32 master_id = 2;
+
+  // Unix timestamp (nanoseconds) when the checkpoint was initiated.
+  int64 initiated_at = 3;
+
+  // The master's current term — used to reject stale checkpoint requests.
+  int64 term = 4;
+}
+
+// CheckpointAck is the follower's response after completing its local
+// checkpoint (flushing metadata + recording WAL position).
+message CheckpointAck {
+  // The follower's node ID.
+  int32 node_id = 1;
+
+  // Whether the local checkpoint was completed successfully.
+  bool success = 2;
+
+  // The WAL entry ID that was the latest at checkpoint time.
+  // Used during recovery to know where to start WAL replay.
+  int64 wal_position = 3;
+
+  // Human-readable error message if success=false.
+  string error_message = 4;
+
+  // Time taken by this node to flush and checkpoint, in milliseconds.
+  int64 checkpoint_duration_ms = 5;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — SNAPSHOT MANAGEMENT
+// =============================================================================
+
+// CreateSnapshotRequest initiates a cluster-wide atomic snapshot.
+// Only sent to the master node. The master coordinates with all followers
+// via SnapshotInit RPCs to create an immutable point-in-time copy.
+message CreateSnapshotRequest {
+  // Optional human-readable label for the snapshot (e.g., "pre-migration").
+  string label = 1;
+
+  // The node ID of the requester.
+  int32 requesting_node_id = 2;
+}
+
+// CreateSnapshotResponse confirms snapshot creation.
+message CreateSnapshotResponse {
+  // Whether the snapshot was created successfully across all nodes.
+  bool success = 1;
+
+  // The unique snapshot ID assigned to this snapshot.
+  string snapshot_id = 2;
+
+  // Human-readable status message.
+  string message = 3;
+
+  // Total time to coordinate the snapshot across all 4 nodes, in milliseconds.
+  int64 coordination_time_ms = 4;
+
+  // The snapshot metadata (file index state, WAL position, etc.).
+  SnapshotInfo snapshot_info = 5;
+}
+
+// ListSnapshotsRequest — retrieve all available snapshots.
+message ListSnapshotsRequest {
+  // The node ID making the request.
+  int32 requesting_node_id = 1;
+}
+
+// ListSnapshotsResponse returns all snapshot metadata.
+message ListSnapshotsResponse {
+  // List of all available snapshots on this node.
+  repeated SnapshotInfo snapshots = 1;
+
+  // Total number of snapshots available.
+  int32 total_count = 2;
+}
+
+// ReadSnapshotRequest — retrieve a specific snapshot's contents.
+message ReadSnapshotRequest {
+  // The snapshot ID to retrieve.
+  string snapshot_id = 1;
+
+  // The node ID making the request.
+  int32 requesting_node_id = 2;
+}
+
+// ReadSnapshotResponse returns the immutable file index captured at snapshot time.
+message ReadSnapshotResponse {
+  // Whether the snapshot was found and readable.
+  bool success = 1;
+
+  // The snapshot metadata.
+  SnapshotInfo snapshot_info = 2;
+
+  // The file index state at snapshot time — immutable copy.
+  repeated FileMetadataProto file_index = 3;
+
+  // Human-readable error message if success=false.
+  string error_message = 4;
+}
+
+// SnapshotInitRequest is sent by the master to each follower during
+// CreateSnapshot. The follower creates a local immutable copy of its
+// state and replies with an ACK.
+message SnapshotInitRequest {
+  // The globally unique snapshot ID.
+  string snapshot_id = 1;
+
+  // The master's node ID.
+  int32 master_id = 2;
+
+  // Unix timestamp (nanoseconds) when the snapshot was initiated.
+  int64 initiated_at = 3;
+
+  // Optional label for the snapshot.
+  string label = 4;
+
+  // The master's current term.
+  int64 term = 5;
+}
+
+// SnapshotInitResponse is the follower's ACK after creating its local snapshot.
+message SnapshotInitResponse {
+  // The follower's node ID.
+  int32 node_id = 1;
+
+  // Whether the local snapshot was created successfully.
+  bool success = 2;
+
+  // The WAL position at the time of the snapshot.
+  int64 wal_position = 3;
+
+  // Human-readable error message if success=false.
+  string error_message = 4;
+
+  // Time taken to create the local snapshot, in milliseconds.
+  int64 snapshot_duration_ms = 5;
+}
+
+// SnapshotInfo contains metadata about a single snapshot.
+// This is the immutable record stored on disk after a successful snapshot.
+message SnapshotInfo {
+  // The globally unique snapshot ID.
+  string snapshot_id = 1;
+
+  // Optional human-readable label.
+  string label = 2;
+
+  // Unix timestamp (nanoseconds) when the snapshot was created.
+  int64 created_at = 3;
+
+  // The node ID that initiated the snapshot.
+  int32 initiated_by = 4;
+
+  // The WAL position at the time of the snapshot.
+  // Recovery loads this snapshot and replays WAL entries AFTER this position.
+  int64 wal_position = 5;
+
+  // Number of files in the index at snapshot time.
+  int32 file_count = 6;
+
+  // Total size of all files at snapshot time, in bytes.
+  int64 total_size_bytes = 7;
+
+  // The master's term at snapshot time.
+  int64 term = 8;
+
+  // List of node IDs that successfully participated in this snapshot.
+  repeated int32 participating_nodes = 9;
+}

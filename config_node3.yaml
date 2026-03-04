@@ -1,0 +1,18 @@
+# Node 3 — Local testing config
+node_id: 3
+listen_port: 50053
+data_dir: "./data/node3"
+
+heartbeat_interval_ms: 200
+heartbeat_timeout_ms: 300
+election_timeout_ms: 200
+replication_factor: 2
+checkpoint_interval: 500
+
+peers:
+  - id: 1
+    address: "localhost:50051"
+  - id: 2
+    address: "localhost:50052"
+  - id: 4
+    address: "localhost:50054"

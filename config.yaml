@@ -1,0 +1,58 @@
+# =============================================================================
+# FileSync Node Configuration — Node 1
+# =============================================================================
+#
+# This configuration file sets up one of the 4 nodes in the FileSync cluster.
+# Duplicate this file as node2_config.yaml, node3_config.yaml, etc. and
+# change node_id, listen_port, and data_dir for each node.
+#
+# For deployment across 4 physical laptops:
+#   - Replace the peer addresses below with actual LAN IP addresses
+#   - Ensure all nodes use the same listen_port (or adjust accordingly)
+#   - Each node must have a unique node_id (1-4)
+#
+# Example LAN setup:
+#   Laptop 1: 192.168.1.101:50051 (node_id: 1)
+#   Laptop 2: 192.168.1.102:50051 (node_id: 2)
+#   Laptop 3: 192.168.1.103:50051 (node_id: 3)
+#   Laptop 4: 192.168.1.104:50051 (node_id: 4)
+# =============================================================================
+
+# Unique identifier for this node (1-4). Higher IDs win Bully elections.
+node_id: 1
+
+# The gRPC port this node listens on.
+listen_port: 50051
+
+# Base directory for local storage. Each node should use a unique directory.
+# Subdirectories created automatically: files/, metadata/, snapshots/, wal/
+data_dir: "./data/node1"
+
+# ----------- Timing Parameters -----------
+
+# How often the master sends heartbeats (milliseconds).
+heartbeat_interval_ms: 200
+
+# If no heartbeat received within this time, trigger election (milliseconds).
+heartbeat_timeout_ms: 300
+
+# Timeout for waiting for OK responses during Bully election (milliseconds).
+election_timeout_ms: 200
+
+# Number of follower replicas to maintain per file (1 or 2).
+replication_factor: 2
+
+# Number of write operations before triggering a coordinated checkpoint.
+checkpoint_interval: 500
+
+# ----------- Cluster Peers -----------
+# List all OTHER nodes in the cluster (not this node).
+# For local testing: use localhost with different ports.
+# For LAN deployment: use the actual IP addresses of each laptop.
+peers:
+  - id: 2
+    address: "localhost:50052"
+  - id: 3
+    address: "localhost:50053"
+  - id: 4
+    address: "localhost:50054"

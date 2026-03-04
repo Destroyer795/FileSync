@@ -1,0 +1,13 @@
+[
+  {
+    "snapshot_id": "snap_1772653662_1",
+    "label": "pre-deploy",
+    "created_at": 1772653664096420300,
+    "initiated_by": 1,
+    "wal_position": 6,
+    "file_count": 2,
+    "total_size_bytes": 0,
+    "term": 3,
+    "participating_nodes": null
+  }
+]
