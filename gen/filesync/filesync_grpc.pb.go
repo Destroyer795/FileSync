@@ -30,6 +30,7 @@ package filesync
 
 import (
 	context "context"
+
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -55,6 +56,7 @@ const (
 	FileSyncService_ForwardWrite_FullMethodName      = "/filesync.FileSyncService/ForwardWrite"
 	FileSyncService_ReplicateFile_FullMethodName     = "/filesync.FileSyncService/ReplicateFile"
 	FileSyncService_CheckpointRequest_FullMethodName = "/filesync.FileSyncService/CheckpointRequest"
+	FileSyncService_GetLeaderInfo_FullMethodName     = "/filesync.FileSyncService/GetLeaderInfo"
 )
 
 // FileSyncServiceClient is the client API for FileSyncService service.
@@ -151,6 +153,8 @@ type FileSyncServiceClient interface {
 	//
 	// Timing: Logs per-node ACK latency and total checkpoint coordination time.
 	CheckpointRequest(ctx context.Context, in *CheckpointReq, opts ...grpc.CallOption) (*CheckpointAck, error)
+	// GetLeaderInfo returns the current leader's IP address, node ID, and term.
+	GetLeaderInfo(ctx context.Context, in *GetLeaderInfoRequest, opts ...grpc.CallOption) (*GetLeaderInfoResponse, error)
 }
 
 type fileSyncServiceClient struct {
@@ -316,6 +320,16 @@ func (c *fileSyncServiceClient) CheckpointRequest(ctx context.Context, in *Check
 	return out, nil
 }
 
+func (c *fileSyncServiceClient) GetLeaderInfo(ctx context.Context, in *GetLeaderInfoRequest, opts ...grpc.CallOption) (*GetLeaderInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLeaderInfoResponse)
+	err := c.cc.Invoke(ctx, FileSyncService_GetLeaderInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FileSyncServiceServer is the server API for FileSyncService service.
 // All implementations must embed UnimplementedFileSyncServiceServer
 // for forward compatibility.
@@ -410,6 +424,8 @@ type FileSyncServiceServer interface {
 	//
 	// Timing: Logs per-node ACK latency and total checkpoint coordination time.
 	CheckpointRequest(context.Context, *CheckpointReq) (*CheckpointAck, error)
+	// GetLeaderInfo returns the current leader's IP address, node ID, and term.
+	GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error)
 	mustEmbedUnimplementedFileSyncServiceServer()
 }
 
@@ -461,6 +477,9 @@ func (UnimplementedFileSyncServiceServer) ReplicateFile(grpc.ClientStreamingServ
 }
 func (UnimplementedFileSyncServiceServer) CheckpointRequest(context.Context, *CheckpointReq) (*CheckpointAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckpointRequest not implemented")
+}
+func (UnimplementedFileSyncServiceServer) GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLeaderInfo not implemented")
 }
 func (UnimplementedFileSyncServiceServer) mustEmbedUnimplementedFileSyncServiceServer() {}
 func (UnimplementedFileSyncServiceServer) testEmbeddedByValue()                         {}
@@ -706,6 +725,24 @@ func _FileSyncService_CheckpointRequest_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FileSyncService_GetLeaderInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLeaderInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FileSyncServiceServer).GetLeaderInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FileSyncService_GetLeaderInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FileSyncServiceServer).GetLeaderInfo(ctx, req.(*GetLeaderInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FileSyncService_ServiceDesc is the grpc.ServiceDesc for FileSyncService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -756,6 +793,10 @@ var FileSyncService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CheckpointRequest",
 			Handler:    _FileSyncService_CheckpointRequest_Handler,
+		},
+		{
+			MethodName: "GetLeaderInfo",
+			Handler:    _FileSyncService_GetLeaderInfo_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

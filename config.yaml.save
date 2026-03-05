@@ -1,4 +1,4 @@
- # =============================================================================
+# =============================================================================
 # FileSync Node Configuration — Node 1
 # =============================================================================
 #
@@ -51,8 +51,8 @@ checkpoint_interval: 500
 # For LAN deployment: use the actual IP addresses of each laptop.
 peers:
   - id: 2
-    address: "10.12.235.187:50051"
+    address: "localhost:50052"
   - id: 3
-    address: "10.12.227.43:50051"
+    address: "localhost:50053"
   - id: 4
-    address: "10.12.235.25:50051"
+    address: "localh:50054"

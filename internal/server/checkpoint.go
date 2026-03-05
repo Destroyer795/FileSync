@@ -101,9 +101,11 @@ func (s *Server) triggerCheckpoint() {
 
 			peerElapsed := time.Since(peerStart)
 			if ack.Success {
+				log.Printf("[MutEx %d] Acquiring local mu for checkpoint ACK count", s.nodeID)
 				mu.Lock()
 				ackCount++
 				mu.Unlock()
+				log.Printf("[MutEx %d] Released local mu for checkpoint ACK count", s.nodeID)
 				log.Printf("[Checkpoint %d] Peer %d ACK (WAL pos: %d, took %v)",
 					s.nodeID, pid, ack.WalPosition, peerElapsed)
 			} else {
@@ -214,9 +216,9 @@ func (s *Server) CheckpointRequest(ctx context.Context, req *filesync.Checkpoint
 		s.nodeID, req.CheckpointId, walPos, elapsed)
 
 	return &filesync.CheckpointAck{
-		NodeId:             s.nodeID,
-		Success:            true,
-		WalPosition:        walPos,
+		NodeId:               s.nodeID,
+		Success:              true,
+		WalPosition:          walPos,
 		CheckpointDurationMs: elapsed,
 	}, nil
 }

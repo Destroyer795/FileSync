@@ -165,6 +165,14 @@ service FileSyncService {
   //
   // Timing: Logs per-node ACK latency and total checkpoint coordination time.
   rpc CheckpointRequest(CheckpointReq) returns (CheckpointAck);
+
+  // ---------------------------------------------------------------------------
+  // LEADER INFO
+  // ---------------------------------------------------------------------------
+
+  // GetLeaderInfo returns the current leader's IP address, node ID, and term.
+  // Can be called on any node — it returns that node's view of the current master.
+  rpc GetLeaderInfo(GetLeaderInfoRequest) returns (GetLeaderInfoResponse);
 }
 
 // =============================================================================
@@ -687,4 +695,32 @@ message SnapshotInfo {
 
   // List of node IDs that successfully participated in this snapshot.
   repeated int32 participating_nodes = 9;
+}
+
+// =============================================================================
+// MESSAGE DEFINITIONS — LEADER INFO
+// =============================================================================
+
+// GetLeaderInfoRequest queries the current leader's identity.
+message GetLeaderInfoRequest {
+  // The node ID making the request (for logging).
+  int32 requesting_node_id = 1;
+}
+
+// GetLeaderInfoResponse returns the current leader's IP address and metadata.
+message GetLeaderInfoResponse {
+  // The node ID of the current master.
+  int32 master_node_id = 1;
+
+  // The IP:port address of the current master (e.g., "10.12.235.187:50051").
+  string master_address = 2;
+
+  // The current election term.
+  int64 term = 3;
+
+  // Whether the responding node itself is the current master.
+  bool is_self_master = 4;
+
+  // The node ID of the responding node.
+  int32 responding_node_id = 5;
 }

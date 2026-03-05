@@ -245,12 +245,14 @@ func (s *Server) Stop() {
 	}
 
 	// Close all peer connections.
+	log.Printf("[MutEx %d] Acquiring peersMu Lock for Stop", s.nodeID)
 	s.peersMu.Lock()
 	for id, conn := range s.peers {
 		conn.Close()
 		log.Printf("[Server %d] Closed connection to peer %d", s.nodeID, id)
 	}
 	s.peersMu.Unlock()
+	log.Printf("[MutEx %d] Released peersMu Lock for Stop", s.nodeID)
 
 	log.Printf("[Server %d] Shutdown complete.", s.nodeID)
 }
@@ -259,9 +261,11 @@ func (s *Server) Stop() {
 // Creates a new connection if one doesn't exist or if the existing
 // connection is in a failed/shutdown state (stale connection invalidation).
 func (s *Server) getPeerClient(peerID int32) (filesync.FileSyncServiceClient, error) {
+	log.Printf("[MutEx %d] Acquiring peersMu RLock for getPeerClient (peer %d)", s.nodeID, peerID)
 	s.peersMu.RLock()
 	conn, ok := s.peers[peerID]
 	s.peersMu.RUnlock()
+	log.Printf("[MutEx %d] Released peersMu RLock for getPeerClient", s.nodeID)
 
 	if ok {
 		// Check connection health — invalidate stale connections!
@@ -273,10 +277,12 @@ func (s *Server) getPeerClient(peerID int32) (filesync.FileSyncServiceClient, er
 			log.Printf("[Server %d] Stale connection to peer %d (state: %v), reconnecting...",
 				s.nodeID, peerID, state)
 			// Remove the stale connection.
+			log.Printf("[MutEx %d] Acquiring peersMu Lock for stale connection cleanup (peer %d)", s.nodeID, peerID)
 			s.peersMu.Lock()
 			conn.Close()
 			delete(s.peers, peerID)
 			s.peersMu.Unlock()
+			log.Printf("[MutEx %d] Released peersMu Lock for stale connection cleanup", s.nodeID)
 		} else {
 			return filesync.NewFileSyncServiceClient(conn), nil
 		}
@@ -288,8 +294,12 @@ func (s *Server) getPeerClient(peerID int32) (filesync.FileSyncServiceClient, er
 		return nil, fmt.Errorf("unknown peer ID: %d", peerID)
 	}
 
+	log.Printf("[MutEx %d] Acquiring peersMu Lock for new connection (peer %d)", s.nodeID, peerID)
 	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
+	defer func() {
+		s.peersMu.Unlock()
+		log.Printf("[MutEx %d] Released peersMu Lock for new connection", s.nodeID)
+	}()
 
 	// Double-check after acquiring write lock (another goroutine may have created it).
 	if conn, ok := s.peers[peerID]; ok {
@@ -323,8 +333,12 @@ func (s *Server) getPeerClient(peerID int32) (filesync.FileSyncServiceClient, er
 // a fresh reconnection on the next RPC attempt. Called when an RPC
 // to a peer fails, indicating the connection may be broken.
 func (s *Server) invalidatePeerConnection(peerID int32) {
+	log.Printf("[MutEx %d] Acquiring peersMu Lock for invalidatePeerConnection (peer %d)", s.nodeID, peerID)
 	s.peersMu.Lock()
-	defer s.peersMu.Unlock()
+	defer func() {
+		s.peersMu.Unlock()
+		log.Printf("[MutEx %d] Released peersMu Lock for invalidatePeerConnection", s.nodeID)
+	}()
 	if conn, ok := s.peers[peerID]; ok {
 		conn.Close()
 		delete(s.peers, peerID)
@@ -350,15 +364,23 @@ func (s *Server) getElectionPriority() int64 {
 // getPeerPriority returns a peer's last known election priority.
 // Returns 0 if the peer's priority is unknown.
 func (s *Server) getPeerPriority(peerID int32) int64 {
+	log.Printf("[MutEx %d] Acquiring peerPrioritiesMu RLock for getPeerPriority", s.nodeID)
 	s.peerPrioritiesMu.RLock()
-	defer s.peerPrioritiesMu.RUnlock()
+	defer func() {
+		s.peerPrioritiesMu.RUnlock()
+		log.Printf("[MutEx %d] Released peerPrioritiesMu RLock", s.nodeID)
+	}()
 	return s.peerPriorities[peerID]
 }
 
 // setPeerPriority stores a peer's election priority.
 func (s *Server) setPeerPriority(peerID int32, priority int64) {
+	log.Printf("[MutEx %d] Acquiring peerPrioritiesMu Lock for setPeerPriority", s.nodeID)
 	s.peerPrioritiesMu.Lock()
-	defer s.peerPrioritiesMu.Unlock()
+	defer func() {
+		s.peerPrioritiesMu.Unlock()
+		log.Printf("[MutEx %d] Released peerPrioritiesMu Lock", s.nodeID)
+	}()
 	s.peerPriorities[peerID] = priority
 }
 
@@ -369,4 +391,40 @@ func (s *Server) getAllPeerIDs() []int32 {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// getMasterAddr returns the IP:port address of the current master node.
+// If this node is the master, returns "localhost:<port>".
+// Returns empty string if no master is elected.
+func (s *Server) getMasterAddr() string {
+	masterID := s.getMasterID()
+	if masterID == 0 {
+		return ""
+	}
+	if masterID == s.nodeID {
+		return fmt.Sprintf("localhost:%d", s.cfg.ListenPort)
+	}
+	addr, ok := s.peerAddrs[masterID]
+	if !ok {
+		return ""
+	}
+	return addr
+}
+
+// GetLeaderInfo returns the current leader's IP address, node ID, and term.
+// Can be called on any node — it returns that node's view of the current master.
+func (s *Server) GetLeaderInfo(ctx context.Context, req *filesync.GetLeaderInfoRequest) (*filesync.GetLeaderInfoResponse, error) {
+	masterID := s.getMasterID()
+	masterAddr := s.getMasterAddr()
+
+	log.Printf("[Server %d] GetLeaderInfo request: master=%d addr=%s term=%d",
+		s.nodeID, masterID, masterAddr, s.term.Load())
+
+	return &filesync.GetLeaderInfoResponse{
+		MasterNodeId:     masterID,
+		MasterAddress:    masterAddr,
+		Term:             s.term.Load(),
+		IsSelfMaster:     s.isMasterNode(),
+		RespondingNodeId: s.nodeID,
+	}, nil
 }

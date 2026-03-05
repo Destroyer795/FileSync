@@ -9,5 +9,16 @@
     "total_size_bytes": 0,
     "term": 3,
     "participating_nodes": null
+  },
+  {
+    "snapshot_id": "snap_1772657742_1",
+    "label": "hii",
+    "created_at": 1772657742295165858,
+    "initiated_by": 1,
+    "wal_position": 6,
+    "file_count": 2,
+    "total_size_bytes": 0,
+    "term": 4,
+    "participating_nodes": null
   }
 ]

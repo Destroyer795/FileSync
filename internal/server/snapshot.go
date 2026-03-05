@@ -49,14 +49,32 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 
 	if !s.isMasterNode() {
 		// Forward to master.
-		masterClient, err := s.getPeerClient(s.getMasterID())
+		masterID := s.getMasterID()
+		masterClient, err := s.getPeerClient(masterID)
 		if err != nil {
+			log.Printf("[Snapshot %d] ⚠️ Master %d unreachable during snapshot forward: %v. Initiating election.",
+				s.nodeID, masterID, err)
+			s.invalidatePeerConnection(masterID)
+			s.masterID.Store(0)
+			go s.startElection()
 			return &filesync.CreateSnapshotResponse{
 				Success: false,
-				Message: fmt.Sprintf("Cannot reach master: %v", err),
+				Message: fmt.Sprintf("Master %d unreachable, election triggered: %v", masterID, err),
 			}, nil
 		}
-		return masterClient.CreateSnapshot(ctx, req)
+		resp, err := masterClient.CreateSnapshot(ctx, req)
+		if err != nil {
+			log.Printf("[Snapshot %d] ⚠️ CreateSnapshot RPC to master %d failed: %v. Initiating election.",
+				s.nodeID, masterID, err)
+			s.invalidatePeerConnection(masterID)
+			s.masterID.Store(0)
+			go s.startElection()
+			return &filesync.CreateSnapshotResponse{
+				Success: false,
+				Message: fmt.Sprintf("Forward to master %d failed, election triggered: %v", masterID, err),
+			}, nil
+		}
+		return resp, nil
 	}
 
 	// Generate unique snapshot ID.
@@ -112,10 +130,12 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 			}
 
 			if resp.Success {
+				log.Printf("[MutEx %d] Acquiring local mu for snapshot ACK count", s.nodeID)
 				mu.Lock()
 				ackCount++
 				participatingNodes = append(participatingNodes, pid)
 				mu.Unlock()
+				log.Printf("[MutEx %d] Released local mu for snapshot ACK count", s.nodeID)
 				log.Printf("[Snapshot %d] Peer %d READY (WAL pos: %d, %dms)",
 					s.nodeID, pid, resp.WalPosition, resp.SnapshotDurationMs)
 			} else {
@@ -146,9 +166,11 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 		ParticipatingNodes: participatingNodes,
 	}
 
+	log.Printf("[MutEx %d] Acquiring snapshotMu Lock for CreateSnapshot commit", s.nodeID)
 	s.snapshotMu.Lock()
 	s.snapshotMeta = append(s.snapshotMeta, snapInfo)
 	s.snapshotMu.Unlock()
+	log.Printf("[MutEx %d] Released snapshotMu Lock for CreateSnapshot commit", s.nodeID)
 
 	// Persist snapshot metadata to disk.
 	s.saveSnapshotMetadata()
@@ -228,9 +250,11 @@ func (s *Server) SnapshotInit(ctx context.Context, req *filesync.SnapshotInitReq
 		Term:        req.Term,
 	}
 
+	log.Printf("[MutEx %d] Acquiring snapshotMu Lock for SnapshotInit commit", s.nodeID)
 	s.snapshotMu.Lock()
 	s.snapshotMeta = append(s.snapshotMeta, snapInfo)
 	s.snapshotMu.Unlock()
+	log.Printf("[MutEx %d] Released snapshotMu Lock for SnapshotInit commit", s.nodeID)
 
 	s.saveSnapshotMetadata()
 
@@ -382,8 +406,12 @@ func (s *Server) loadSnapshotMetadata() {
 		return
 	}
 
+	log.Printf("[MutEx %d] Acquiring snapshotMu Lock for loadSnapshotMetadata", s.nodeID)
 	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
+	defer func() {
+		s.snapshotMu.Unlock()
+		log.Printf("[MutEx %d] Released snapshotMu Lock for loadSnapshotMetadata", s.nodeID)
+	}()
 
 	if err := json.Unmarshal(data, &s.snapshotMeta); err != nil {
 		log.Printf("[Snapshot %d] Warning: failed to parse snapshot metadata: %v", s.nodeID, err)

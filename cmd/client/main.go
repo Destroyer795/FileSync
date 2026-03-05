@@ -78,6 +78,8 @@ func main() {
 		handleDelete(client, args[1:])
 	case "snapshot":
 		handleSnapshot(client, args[1:])
+	case "leader":
+		handleLeader(client)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		printUsage()
@@ -440,6 +442,35 @@ func formatSize(bytes int64) string {
 	}
 }
 
+// ----------- Leader Info -----------
+
+func handleLeader(client filesync.FileSyncServiceClient) {
+	fmt.Println("Querying current leader...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.GetLeaderInfo(ctx, &filesync.GetLeaderInfoRequest{})
+	if err != nil {
+		log.Fatalf("GetLeaderInfo failed: %v", err)
+	}
+
+	if resp.MasterNodeId == 0 {
+		fmt.Println("⚠️  No leader currently elected.")
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("  Current Leader IP : %s\n", resp.MasterAddress)
+	fmt.Printf("  Leader Node ID    : %d\n", resp.MasterNodeId)
+	fmt.Printf("  Election Term     : %d\n", resp.Term)
+	fmt.Printf("  Responding Node   : %d\n", resp.RespondingNodeId)
+	if resp.IsSelfMaster {
+		fmt.Println("  (This node is the current leader)")
+	}
+	fmt.Println()
+}
+
 func printUsage() {
 	fmt.Println(`
 FileSync CLI - Distributed File Sharing Client
@@ -455,6 +486,7 @@ Commands:
   download  <filename> [output_path]   Download a file from the cluster
   list                                 List all files in the cluster
   delete    <filename>                 Delete a file from the cluster
+  leader                               Show current leader IP and info
   snapshot  create [label]             Create a cluster-wide snapshot
   snapshot  list                       List all available snapshots
   snapshot  read <snapshot_id>         Read a snapshot's file index
@@ -463,6 +495,7 @@ Examples:
   filesync-cli -addr 192.168.1.101:50051 upload ./report.pdf
   filesync-cli -addr 192.168.1.101:50051 list
   filesync-cli -addr 192.168.1.101:50051 download report.pdf ./local_copy.pdf
+  filesync-cli -addr 192.168.1.101:50051 leader
   filesync-cli -addr 192.168.1.101:50051 snapshot create "before-update"
   filesync-cli -addr 192.168.1.101:50051 snapshot list
   filesync-cli -addr 192.168.1.101:50051 snapshot read snap_1709654400_1

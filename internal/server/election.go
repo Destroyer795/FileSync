@@ -310,7 +310,8 @@ func (s *Server) declareVictory(priority int64, electionStart time.Time) {
 	}
 
 	wg.Wait()
-	log.Printf("[Election %d] Victory broadcast complete. Starting heartbeat loop.", s.nodeID)
+	log.Printf("[Election %d] Victory broadcast complete. Starting heartbeat loop. Master IP: %s",
+		s.nodeID, s.getMasterAddr())
 
 	// Start broadcasting heartbeats as the new master.
 	go s.heartbeatBroadcastLoop()

@@ -135,11 +135,15 @@ func (s *Server) Upload(stream filesync.FileSyncService_UploadServer) error {
 func (s *Server) executeUpload(filename string, data []byte) (int64, error) {
 	// Step 1: Acquire the centralized write lock.
 	// This is the Centralized Server mutual exclusion — single-threaded writes.
+	log.Printf("[MutEx %d] Acquiring writeMu for UPLOAD '%s'", s.nodeID, filename)
 	lockStart := time.Now()
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	defer func() {
+		s.writeMu.Unlock()
+		log.Printf("[MutEx %d] Released writeMu for UPLOAD '%s'", s.nodeID, filename)
+	}()
 	lockWait := time.Since(lockStart)
-	log.Printf("[FileOps %d] Write lock acquired for '%s' (waited %v)",
+	log.Printf("[MutEx %d] writeMu acquired for UPLOAD '%s' (waited %v)",
 		s.nodeID, filename, lockWait)
 
 	// Step 2: Determine the new version number.
@@ -307,8 +311,12 @@ func (s *Server) Delete(ctx context.Context, req *filesync.DeleteRequest) (*file
 // executeDelete is the master's internal delete handler.
 func (s *Server) executeDelete(filename string) error {
 	// Acquire the centralized write lock.
+	log.Printf("[MutEx %d] Acquiring writeMu for DELETE '%s'", s.nodeID, filename)
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	defer func() {
+		s.writeMu.Unlock()
+		log.Printf("[MutEx %d] Released writeMu for DELETE '%s'", s.nodeID, filename)
+	}()
 
 	// Check if file exists.
 	meta := s.fileIndex.Get(filename)
@@ -443,6 +451,7 @@ func (s *Server) ForwardWrite(ctx context.Context, req *filesync.ForwardWriteReq
 }
 
 // forwardWriteToMaster sends a write operation to the current master.
+// If the master is unreachable, triggers a new leader election.
 func (s *Server) forwardWriteToMaster(operation, filename string, data []byte) (*filesync.ForwardWriteResponse, error) {
 	masterID := s.getMasterID()
 	if masterID == 0 {
@@ -451,7 +460,12 @@ func (s *Server) forwardWriteToMaster(operation, filename string, data []byte) (
 
 	client, err := s.getPeerClient(masterID)
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to master %d: %w", masterID, err)
+		log.Printf("[FileOps %d] ⚠️ Master %d unreachable during write forward: %v. Initiating election.",
+			s.nodeID, masterID, err)
+		s.invalidatePeerConnection(masterID)
+		s.masterID.Store(0)
+		go s.startElection()
+		return nil, fmt.Errorf("master %d unreachable, election triggered: %w", masterID, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -467,7 +481,7 @@ func (s *Server) forwardWriteToMaster(operation, filename string, data []byte) (
 		}
 	}
 
-	return client.ForwardWrite(ctx, &filesync.ForwardWriteRequest{
+	resp, err := client.ForwardWrite(ctx, &filesync.ForwardWriteRequest{
 		Operation:    operation,
 		Filename:     filename,
 		FileData:     data,
@@ -475,4 +489,15 @@ func (s *Server) forwardWriteToMaster(operation, filename string, data []byte) (
 		Metadata:     metaProto,
 		ForwardedAt:  time.Now().UnixNano(),
 	})
+
+	if err != nil {
+		log.Printf("[FileOps %d] ⚠️ ForwardWrite RPC to master %d failed: %v. Initiating election.",
+			s.nodeID, masterID, err)
+		s.invalidatePeerConnection(masterID)
+		s.masterID.Store(0)
+		go s.startElection()
+		return nil, fmt.Errorf("ForwardWrite to master %d failed, election triggered: %w", masterID, err)
+	}
+
+	return resp, nil
 }

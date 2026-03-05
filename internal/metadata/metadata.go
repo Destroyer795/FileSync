@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -85,8 +86,12 @@ func NewFileIndex() *FileIndex {
 // Get retrieves metadata for a file by name. Returns nil if not found.
 // Thread-safe for concurrent reads.
 func (fi *FileIndex) Get(filename string) *FileMetadata {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for Get('%s')", filename)
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	defer func() {
+		fi.mu.RUnlock()
+		log.Printf("[MutEx FileIndex] Released RLock for Get")
+	}()
 	meta, ok := fi.files[filename]
 	if !ok {
 		return nil
@@ -100,8 +105,12 @@ func (fi *FileIndex) Get(filename string) *FileMetadata {
 
 // Put adds or updates a file's metadata in the index.
 func (fi *FileIndex) Put(meta *FileMetadata) {
+	log.Printf("[MutEx FileIndex] Acquiring Lock for Put('%s')", meta.Filename)
 	fi.mu.Lock()
-	defer fi.mu.Unlock()
+	defer func() {
+		fi.mu.Unlock()
+		log.Printf("[MutEx FileIndex] Released Lock for Put")
+	}()
 	// Store a copy so callers can't mutate the stored value.
 	stored := *meta
 	stored.Replicas = make([]int32, len(meta.Replicas))
@@ -111,8 +120,12 @@ func (fi *FileIndex) Put(meta *FileMetadata) {
 
 // Delete removes a file from the index. Returns true if it existed.
 func (fi *FileIndex) Delete(filename string) bool {
+	log.Printf("[MutEx FileIndex] Acquiring Lock for Delete('%s')", filename)
 	fi.mu.Lock()
-	defer fi.mu.Unlock()
+	defer func() {
+		fi.mu.Unlock()
+		log.Printf("[MutEx FileIndex] Released Lock for Delete")
+	}()
 	_, ok := fi.files[filename]
 	if ok {
 		delete(fi.files, filename)
@@ -122,8 +135,12 @@ func (fi *FileIndex) Delete(filename string) bool {
 
 // List returns a copy of all file metadata entries.
 func (fi *FileIndex) List() []*FileMetadata {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for List")
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	defer func() {
+		fi.mu.RUnlock()
+		log.Printf("[MutEx FileIndex] Released RLock for List")
+	}()
 	result := make([]*FileMetadata, 0, len(fi.files))
 	for _, meta := range fi.files {
 		copied := *meta
@@ -136,15 +153,23 @@ func (fi *FileIndex) List() []*FileMetadata {
 
 // Count returns the number of files in the index.
 func (fi *FileIndex) Count() int {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for Count")
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	defer func() {
+		fi.mu.RUnlock()
+		log.Printf("[MutEx FileIndex] Released RLock for Count")
+	}()
 	return len(fi.files)
 }
 
 // TotalSize returns the sum of all file sizes in the index.
 func (fi *FileIndex) TotalSize() int64 {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for TotalSize")
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	defer func() {
+		fi.mu.RUnlock()
+		log.Printf("[MutEx FileIndex] Released RLock for TotalSize")
+	}()
 	var total int64
 	for _, meta := range fi.files {
 		total += meta.Size
@@ -155,8 +180,12 @@ func (fi *FileIndex) TotalSize() int64 {
 // Snapshot returns an immutable deep copy of the current file index.
 // Used during coordinated checkpointing and snapshot creation.
 func (fi *FileIndex) Snapshot() map[string]*FileMetadata {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for Snapshot")
 	fi.mu.RLock()
-	defer fi.mu.RUnlock()
+	defer func() {
+		fi.mu.RUnlock()
+		log.Printf("[MutEx FileIndex] Released RLock for Snapshot")
+	}()
 	snapshot := make(map[string]*FileMetadata, len(fi.files))
 	for k, v := range fi.files {
 		copied := *v
@@ -170,8 +199,12 @@ func (fi *FileIndex) Snapshot() map[string]*FileMetadata {
 // LoadFromMap replaces the entire index with the given map.
 // Used during crash recovery to restore from a checkpoint.
 func (fi *FileIndex) LoadFromMap(m map[string]*FileMetadata) {
+	log.Printf("[MutEx FileIndex] Acquiring Lock for LoadFromMap")
 	fi.mu.Lock()
-	defer fi.mu.Unlock()
+	defer func() {
+		fi.mu.Unlock()
+		log.Printf("[MutEx FileIndex] Released Lock for LoadFromMap")
+	}()
 	fi.files = make(map[string]*FileMetadata, len(m))
 	for k, v := range m {
 		copied := *v
@@ -184,9 +217,11 @@ func (fi *FileIndex) LoadFromMap(m map[string]*FileMetadata) {
 // SaveToFile persists the file index to a JSON file atomically.
 // Writes to a temp file first, then renames for crash safety.
 func (fi *FileIndex) SaveToFile(path string) error {
+	log.Printf("[MutEx FileIndex] Acquiring RLock for SaveToFile")
 	fi.mu.RLock()
 	snapshot := fi.files
 	fi.mu.RUnlock()
+	log.Printf("[MutEx FileIndex] Released RLock for SaveToFile")
 
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {

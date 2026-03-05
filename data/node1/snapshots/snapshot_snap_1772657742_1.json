@@ -9,5 +9,16 @@
     ],
     "created_at": 1772652386319294400,
     "updated_at": 1772652407538969200
+  },
+  "myfile2.txt": {
+    "filename": "myfile2.txt",
+    "version": 1,
+    "size": 15,
+    "checksum": "66ea059a9a7865f3575325a6771d694e45ae60206da564376edd089a8a27cbed",
+    "replicas": [
+      1
+    ],
+    "created_at": 1772652427650742700,
+    "updated_at": 1772652427650742700
   }
 }

@@ -93,8 +93,12 @@ func NewWAL(walDir string) (*WAL, error) {
 // Returns the assigned entry ID. The entry is initially uncommitted.
 func (w *WAL) Append(operation, filename string, version int64) (int64, error) {
 	start := time.Now()
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for Append (op=%s file=%s)", operation, filename)
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for Append")
+	}()
 
 	entryID := w.nextID.Add(1) - 1
 
@@ -133,8 +137,12 @@ func (w *WAL) Append(operation, filename string, version int64) (int64, error) {
 // MarkCommitted marks a WAL entry as committed by rewriting the WAL.
 // This is called after the operation has been successfully executed and replicated.
 func (w *WAL) MarkCommitted(entryID int64) error {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for MarkCommitted (entry %d)", entryID)
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for MarkCommitted")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -161,8 +169,12 @@ func (w *WAL) MarkCommitted(entryID int64) error {
 // SetCheckpointID updates all entries up to the given entry ID with the
 // specified checkpoint ID. Called during coordinated checkpointing.
 func (w *WAL) SetCheckpointID(upToEntryID, checkpointID int64) error {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for SetCheckpointID")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for SetCheckpointID")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -181,8 +193,12 @@ func (w *WAL) SetCheckpointID(upToEntryID, checkpointID int64) error {
 // Replay returns all WAL entries with entry IDs strictly greater than
 // afterEntryID. Used during crash recovery to replay uncommitted operations.
 func (w *WAL) Replay(afterEntryID int64) ([]WALEntry, error) {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for Replay")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for Replay")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -203,8 +219,12 @@ func (w *WAL) Replay(afterEntryID int64) ([]WALEntry, error) {
 // GetUncommitted returns all WAL entries that have not been committed.
 // Used during crash recovery to identify operations that need to be re-executed.
 func (w *WAL) GetUncommitted() ([]WALEntry, error) {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for GetUncommitted")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for GetUncommitted")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -225,8 +245,12 @@ func (w *WAL) GetUncommitted() ([]WALEntry, error) {
 // Called after a successful coordinated checkpoint to free disk space.
 func (w *WAL) Prune(checkpointID int64) error {
 	start := time.Now()
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for Prune")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for Prune")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -256,8 +280,12 @@ func (w *WAL) Prune(checkpointID int64) error {
 // GetLatestEntryID returns the highest entry ID currently in the WAL.
 // Returns 0 if the WAL is empty.
 func (w *WAL) GetLatestEntryID() (int64, error) {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for GetLatestEntryID")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for GetLatestEntryID")
+	}()
 
 	entries, err := w.readAllEntriesLocked()
 	if err != nil {
@@ -275,15 +303,23 @@ func (w *WAL) GetLatestEntryID() (int64, error) {
 
 // Fsync flushes the WAL file to disk. Called during checkpointing.
 func (w *WAL) Fsync() error {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for Fsync")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for Fsync")
+	}()
 	return w.file.Sync()
 }
 
 // Close closes the WAL file handle.
 func (w *WAL) Close() error {
+	log.Printf("[MutEx WAL] Acquiring WAL mutex for Close")
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	defer func() {
+		w.mu.Unlock()
+		log.Printf("[MutEx WAL] Released WAL mutex for Close")
+	}()
 	return w.file.Close()
 }
 
