@@ -1,25 +1,35 @@
 // =============================================================================
-// Filesystem Snapshots — Immutable Point-in-Time Copies
+// Filesystem Snapshots — Chandy-Lamport Distributed Snapshot Algorithm
 // =============================================================================
 //
-// Implements the coordinated snapshot protocol:
+// Implements the Chandy-Lamport algorithm for consistent distributed snapshots:
 //
-// 1. CREATE SNAPSHOT:
-//    a) The master assigns a snapshot version/ID and broadcasts SNAPSHOT-INIT
-//       to all follower nodes.
-//    b) Each node atomically copies its file_index.json to
-//       snapshots/snapshot_<id>.json and records the current WAL position.
-//    c) Each node replies with SNAPSHOT-READY.
-//    d) The master waits for 4/4 ACKs and commits the snapshot metadata.
+// 1. INITIATE: Any node (typically the master) can initiate a snapshot.
+//    The initiator:
+//    a) Records its own local state (file index + WAL position).
+//    b) Sends a MARKER message on all outgoing channels (to all peers).
+//    c) Begins recording incoming messages on all channels.
 //
-// 2. LIST SNAPSHOTS:
-//    Returns metadata for all available snapshots on this node.
+// 2. MARKER RECEIPT: When a node receives a MARKER on channel C:
+//    a) If this is the FIRST marker for this snapshot ID:
+//       - The node records its own local state.
+//       - Sends MARKER messages on all its outgoing channels.
+//       - Starts recording messages on all incoming channels EXCEPT C.
+//       - Records channel C's state as empty (no messages in transit).
+//    b) If the node has ALREADY recorded its state for this snapshot:
+//       - Stops recording on channel C.
+//       - Saves all messages recorded on C as the channel state.
 //
-// 3. READ SNAPSHOT:
-//    Retrieves the immutable file index from a specific snapshot file.
-//    This allows viewing historical file versions.
+// 3. COMPLETION: The snapshot is complete at a node when it has received
+//    MARKER messages on all incoming channels. The global snapshot consists
+//    of all local states plus all channel states.
 //
-// Snapshots are IMMUTABLE once committed — they are never modified.
+// In FileSync's context:
+//   - "Local state" = file index snapshot + WAL position
+//   - "Channels" = gRPC connections between peer nodes
+//   - "Messages" = file operation events (uploads/deletes) in transit
+//
+// Tagged with [CL-Snapshot] in log messages for identification.
 // =============================================================================
 
 package server
@@ -40,62 +50,133 @@ import (
 	"github.com/filesync/internal/metadata"
 )
 
-// ----------- CreateSnapshot Handler -----------
+// ----------- Chandy-Lamport Snapshot State -----------
 
-// CreateSnapshot coordinates an atomic snapshot across all 4 nodes.
-// Only the master can initiate this. Broadcasts SnapshotInit to all followers.
+// clSnapshotState tracks the in-progress state of a Chandy-Lamport snapshot
+// for a particular snapshot ID on this node.
+type clSnapshotState struct {
+	snapshotID string
+	recorded   bool   // Whether this node has recorded its local state.
+	label      string // User-provided label for the snapshot.
+
+	// Channel states: maps peer node ID -> list of operations observed
+	// on that channel between our state recording and receiving their MARKER.
+	channelState map[int32][]string // peerID -> recorded operation descriptions
+	// Which peers have we received MARKERs from?
+	markersReceived map[int32]bool
+	// Total number of peers we expect MARKERs from.
+	totalPeers int
+	// Who initiated this snapshot.
+	initiatedBy int32
+	// WAL position at time of state recording.
+	walPosition int64
+	// When the snapshot started.
+	startTime time.Time
+
+	mu sync.Mutex
+}
+
+// activeSnapshots tracks all in-progress Chandy-Lamport snapshots.
+// Key is the snapshot ID.
+var activeSnapshots = struct {
+	mu sync.Mutex
+	m  map[string]*clSnapshotState
+}{m: make(map[string]*clSnapshotState)}
+
+// getOrCreateCLState returns the snapshot state for the given ID,
+// creating it if it doesn't exist.
+func getOrCreateCLState(snapshotID string, totalPeers int) *clSnapshotState {
+	activeSnapshots.mu.Lock()
+	defer activeSnapshots.mu.Unlock()
+
+	if state, ok := activeSnapshots.m[snapshotID]; ok {
+		return state
+	}
+
+	state := &clSnapshotState{
+		snapshotID:      snapshotID,
+		channelState:    make(map[int32][]string),
+		markersReceived: make(map[int32]bool),
+		totalPeers:      totalPeers,
+		startTime:       time.Now(),
+	}
+	activeSnapshots.m[snapshotID] = state
+	return state
+}
+
+// removeCLState removes a completed snapshot state.
+func removeCLState(snapshotID string) {
+	activeSnapshots.mu.Lock()
+	defer activeSnapshots.mu.Unlock()
+	delete(activeSnapshots.m, snapshotID)
+}
+
+// RecordChannelMessage records an in-flight operation on a channel from
+// the given peer, if there is an active snapshot where we have recorded
+// our state but have not yet received a MARKER from that peer.
+func (s *Server) RecordChannelMessage(fromPeerID int32, opDescription string) {
+	activeSnapshots.mu.Lock()
+	snapshots := make([]*clSnapshotState, 0)
+	for _, state := range activeSnapshots.m {
+		snapshots = append(snapshots, state)
+	}
+	activeSnapshots.mu.Unlock()
+
+	for _, state := range snapshots {
+		state.mu.Lock()
+		if state.recorded && !state.markersReceived[fromPeerID] {
+			// We have recorded our state but haven't received MARKER from this peer.
+			// Record this message as part of the channel state.
+			state.channelState[fromPeerID] = append(state.channelState[fromPeerID], opDescription)
+			log.Printf("[CL-Snapshot %d] Recorded channel message from peer %d: %s (snapshot '%s')",
+				s.nodeID, fromPeerID, opDescription, state.snapshotID)
+		}
+		state.mu.Unlock()
+	}
+}
+
+// ----------- CreateSnapshot Handler (Initiator) -----------
+
+// CreateSnapshot initiates a Chandy-Lamport distributed snapshot.
+// The initiator records its own state and sends MARKER to all peers.
 func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapshotRequest) (*filesync.CreateSnapshotResponse, error) {
 	startTime := time.Now()
-
-	if !s.isMasterNode() {
-		// Forward to master.
-		masterID := s.getMasterID()
-		masterClient, err := s.getPeerClient(masterID)
-		if err != nil {
-			log.Printf("[Snapshot %d] ⚠️ Master %d unreachable during snapshot forward: %v. Initiating election.",
-				s.nodeID, masterID, err)
-			s.invalidatePeerConnection(masterID)
-			s.masterID.Store(0)
-			go s.startElection()
-			return &filesync.CreateSnapshotResponse{
-				Success: false,
-				Message: fmt.Sprintf("Master %d unreachable, election triggered: %v", masterID, err),
-			}, nil
-		}
-		resp, err := masterClient.CreateSnapshot(ctx, req)
-		if err != nil {
-			log.Printf("[Snapshot %d] ⚠️ CreateSnapshot RPC to master %d failed: %v. Initiating election.",
-				s.nodeID, masterID, err)
-			s.invalidatePeerConnection(masterID)
-			s.masterID.Store(0)
-			go s.startElection()
-			return &filesync.CreateSnapshotResponse{
-				Success: false,
-				Message: fmt.Sprintf("Forward to master %d failed, election triggered: %v", masterID, err),
-			}, nil
-		}
-		return resp, nil
-	}
 
 	// Generate unique snapshot ID.
 	snapshotID := fmt.Sprintf("snap_%d_%d", time.Now().Unix(), s.nodeID)
 	label := req.Label
 	currentTerm := s.term.Load()
+	allPeers := s.getAllPeerIDs()
 
-	log.Printf("[Snapshot %d] 📸 Creating snapshot '%s' (label: '%s')", s.nodeID, snapshotID, label)
+	log.Printf("[CL-Snapshot %d] Initiating Chandy-Lamport snapshot '%s' (label: '%s')",
+		s.nodeID, snapshotID, label)
 
-	// Step 1: Perform master's local snapshot.
+	// Step 1: Record own local state (Chandy-Lamport rule: initiator records first).
+	state := getOrCreateCLState(snapshotID, len(allPeers))
+	state.mu.Lock()
+	state.recorded = true
+	state.label = label
+	state.initiatedBy = s.nodeID
+	state.mu.Unlock()
+
 	walPos, err := s.performLocalSnapshot(snapshotID, label)
 	if err != nil {
+		removeCLState(snapshotID)
 		return &filesync.CreateSnapshotResponse{
 			Success: false,
-			Message: fmt.Sprintf("Master snapshot failed: %v", err),
+			Message: fmt.Sprintf("Failed to record local state: %v", err),
 		}, nil
 	}
 
-	// Step 2: Broadcast SNAPSHOT-INIT to all followers.
-	allPeers := s.getAllPeerIDs()
-	ackCount := 1 // Master already done.
+	state.mu.Lock()
+	state.walPosition = walPos
+	state.mu.Unlock()
+
+	log.Printf("[CL-Snapshot %d] Local state recorded (WAL pos: %d). Sending MARKER to %d peers.",
+		s.nodeID, walPos, len(allPeers))
+
+	// Step 2: Send MARKER to all outgoing channels (all peers).
+	ackCount := 1 // We count ourselves.
 	totalNodes := len(allPeers) + 1
 	participatingNodes := []int32{s.nodeID}
 
@@ -109,12 +190,16 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 
 			client, err := s.getPeerClient(pid)
 			if err != nil {
-				log.Printf("[Snapshot %d] Cannot reach peer %d: %v", s.nodeID, pid, err)
+				log.Printf("[CL-Snapshot %d] Cannot reach peer %d to send MARKER: %v",
+					s.nodeID, pid, err)
 				return
 			}
 
 			peerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
+
+			log.Printf("[CL-Snapshot %d] Sending MARKER to peer %d (snapshot '%s')",
+				s.nodeID, pid, snapshotID)
 
 			resp, err := client.SnapshotInit(peerCtx, &filesync.SnapshotInitRequest{
 				SnapshotId:  snapshotID,
@@ -125,33 +210,55 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 			})
 
 			if err != nil {
-				log.Printf("[Snapshot %d] Peer %d snapshot failed: %v", s.nodeID, pid, err)
+				log.Printf("[CL-Snapshot %d] MARKER to peer %d failed: %v",
+					s.nodeID, pid, err)
 				return
 			}
 
 			if resp.Success {
-				log.Printf("[MutEx %d] Acquiring local mu for snapshot ACK count", s.nodeID)
 				mu.Lock()
 				ackCount++
 				participatingNodes = append(participatingNodes, pid)
 				mu.Unlock()
-				log.Printf("[MutEx %d] Released local mu for snapshot ACK count", s.nodeID)
-				log.Printf("[Snapshot %d] Peer %d READY (WAL pos: %d, %dms)",
+
+				log.Printf("[CL-Snapshot %d] Peer %d recorded state (WAL pos: %d, %dms)",
 					s.nodeID, pid, resp.WalPosition, resp.SnapshotDurationMs)
 			} else {
-				log.Printf("[Snapshot %d] Peer %d FAILED: %s", s.nodeID, pid, resp.ErrorMessage)
+				log.Printf("[CL-Snapshot %d] Peer %d failed to process MARKER: %s",
+					s.nodeID, pid, resp.ErrorMessage)
 			}
 		}(peerID)
 	}
 
-	// Step 3: Wait for all ACKs.
+	// Step 3: Wait for all MARKERs to be processed.
 	wg.Wait()
 	totalElapsed := time.Since(startTime)
 
+	// Mark all peers as having sent us markers (as initiator, we consider all
+	// channels complete once peers have responded to our MARKER).
+	state.mu.Lock()
+	for _, pid := range allPeers {
+		state.markersReceived[pid] = true
+	}
+
+	// Collect channel states for logging.
+	totalChannelMsgs := 0
+	for pid, msgs := range state.channelState {
+		if len(msgs) > 0 {
+			log.Printf("[CL-Snapshot %d] Channel state from peer %d: %d messages recorded",
+				s.nodeID, pid, len(msgs))
+			totalChannelMsgs += len(msgs)
+		}
+	}
+	state.mu.Unlock()
+
 	if ackCount < totalNodes {
-		log.Printf("[Snapshot %d] ⚠️ Snapshot '%s' incomplete (%d/%d nodes, %v)",
+		log.Printf("[CL-Snapshot %d] Snapshot '%s' incomplete (%d/%d nodes, %v)",
 			s.nodeID, snapshotID, ackCount, totalNodes, totalElapsed)
 	}
+
+	log.Printf("[CL-Snapshot %d] Snapshot '%s' complete: %d/%d nodes, %d channel messages captured, %v",
+		s.nodeID, snapshotID, ackCount, totalNodes, totalChannelMsgs, totalElapsed)
 
 	// Step 4: Commit snapshot metadata.
 	snapInfo := &metadata.SnapshotInfo{
@@ -172,16 +279,15 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *filesync.CreateSnapsho
 	s.snapshotMu.Unlock()
 	log.Printf("[MutEx %d] Released snapshotMu Lock for CreateSnapshot commit", s.nodeID)
 
-	// Persist snapshot metadata to disk.
 	s.saveSnapshotMetadata()
 
-	log.Printf("[Snapshot %d] ✅ Snapshot '%s' committed (%d/%d nodes, %v)",
-		s.nodeID, snapshotID, ackCount, totalNodes, totalElapsed)
+	// Clean up the in-progress state.
+	removeCLState(snapshotID)
 
 	return &filesync.CreateSnapshotResponse{
 		Success:            true,
 		SnapshotId:         snapshotID,
-		Message:            fmt.Sprintf("Snapshot created with %d/%d nodes", ackCount, totalNodes),
+		Message:            fmt.Sprintf("Chandy-Lamport snapshot with %d/%d nodes", ackCount, totalNodes),
 		CoordinationTimeMs: totalElapsed.Milliseconds(),
 		SnapshotInfo: &filesync.SnapshotInfo{
 			SnapshotId:         snapshotID,
@@ -217,55 +323,158 @@ func (s *Server) performLocalSnapshot(snapshotID, label string) (int64, error) {
 		return 0, fmt.Errorf("failed to write snapshot file: %w", err)
 	}
 
-	log.Printf("[Snapshot %d] Local snapshot '%s' saved to %s", s.nodeID, snapshotID, snapshotFile)
+	log.Printf("[CL-Snapshot %d] Local state saved to %s", s.nodeID, snapshotFile)
 	return walPos, nil
 }
 
-// ----------- SnapshotInit Handler (Follower Side) -----------
+// ----------- SnapshotInit Handler (MARKER Receiver) -----------
 
-// SnapshotInit handles incoming snapshot requests from the master.
+// SnapshotInit handles incoming MARKER messages from peers.
+// Per Chandy-Lamport:
+//   - First MARKER for this snapshot: record own state, forward MARKERs, mark
+//     channel from sender as empty.
+//   - Subsequent MARKER: stop recording on that channel, save channel state.
 func (s *Server) SnapshotInit(ctx context.Context, req *filesync.SnapshotInitRequest) (*filesync.SnapshotInitResponse, error) {
 	startTime := time.Now()
-	log.Printf("[Snapshot %d] Received SNAPSHOT-INIT '%s' from master %d",
-		s.nodeID, req.SnapshotId, req.MasterId)
+	senderID := req.MasterId
 
-	// Perform local snapshot.
-	walPos, err := s.performLocalSnapshot(req.SnapshotId, req.Label)
-	if err != nil {
+	log.Printf("[CL-Snapshot %d] Received MARKER from node %d for snapshot '%s'",
+		s.nodeID, senderID, req.SnapshotId)
+
+	allPeers := s.getAllPeerIDs()
+	state := getOrCreateCLState(req.SnapshotId, len(allPeers))
+
+	state.mu.Lock()
+	firstMarker := !state.recorded
+	state.mu.Unlock()
+
+	if firstMarker {
+		// First MARKER: record own local state.
+		log.Printf("[CL-Snapshot %d] First MARKER received (from node %d). Recording local state.",
+			s.nodeID, senderID)
+
+		state.mu.Lock()
+		state.recorded = true
+		state.label = req.Label
+		state.initiatedBy = req.MasterId
+		state.mu.Unlock()
+
+		walPos, err := s.performLocalSnapshot(req.SnapshotId, req.Label)
+		if err != nil {
+			log.Printf("[CL-Snapshot %d] Failed to record local state: %v", s.nodeID, err)
+			return &filesync.SnapshotInitResponse{
+				NodeId:       s.nodeID,
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("Failed to record state: %v", err),
+			}, nil
+		}
+
+		state.mu.Lock()
+		state.walPosition = walPos
+		// Mark the sender's channel as empty (no messages in transit on this
+		// channel since we recorded state immediately upon receiving the MARKER).
+		state.markersReceived[senderID] = true
+		state.channelState[senderID] = []string{} // Empty channel state.
+		state.mu.Unlock()
+
+		log.Printf("[CL-Snapshot %d] State recorded (WAL pos: %d). Channel from node %d marked empty.",
+			s.nodeID, walPos, senderID)
+
+		// Forward MARKER to all other peers (not back to sender).
+		for _, pid := range allPeers {
+			if pid == senderID {
+				continue // Don't send back to the sender.
+			}
+			go func(peerID int32) {
+				client, err := s.getPeerClient(peerID)
+				if err != nil {
+					log.Printf("[CL-Snapshot %d] Cannot forward MARKER to peer %d: %v",
+						s.nodeID, peerID, err)
+					return
+				}
+
+				fwdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+
+				log.Printf("[CL-Snapshot %d] Forwarding MARKER to peer %d (snapshot '%s')",
+					s.nodeID, peerID, req.SnapshotId)
+
+				_, err = client.SnapshotInit(fwdCtx, &filesync.SnapshotInitRequest{
+					SnapshotId:  req.SnapshotId,
+					MasterId:    s.nodeID, // We are the sender now.
+					InitiatedAt: req.InitiatedAt,
+					Label:       req.Label,
+					Term:        req.Term,
+				})
+
+				if err != nil {
+					log.Printf("[CL-Snapshot %d] MARKER forwarding to peer %d failed: %v",
+						s.nodeID, peerID, err)
+				} else {
+					log.Printf("[CL-Snapshot %d] MARKER forwarded to peer %d",
+						s.nodeID, peerID)
+				}
+			}(pid)
+		}
+
+		// Store snapshot metadata locally.
+		snapInfo := &metadata.SnapshotInfo{
+			SnapshotID:  req.SnapshotId,
+			Label:       req.Label,
+			CreatedAt:   time.Now().UnixNano(),
+			InitiatedBy: req.MasterId,
+			WALPosition: walPos,
+			FileCount:   int32(s.fileIndex.Count()),
+			Term:        req.Term,
+		}
+
+		log.Printf("[MutEx %d] Acquiring snapshotMu Lock for SnapshotInit commit", s.nodeID)
+		s.snapshotMu.Lock()
+		s.snapshotMeta = append(s.snapshotMeta, snapInfo)
+		s.snapshotMu.Unlock()
+		log.Printf("[MutEx %d] Released snapshotMu Lock for SnapshotInit commit", s.nodeID)
+
+		s.saveSnapshotMetadata()
+
+		elapsed := time.Since(startTime).Milliseconds()
+		log.Printf("[CL-Snapshot %d] Snapshot '%s' local processing complete (%dms)",
+			s.nodeID, req.SnapshotId, elapsed)
+
 		return &filesync.SnapshotInitResponse{
-			NodeId:       s.nodeID,
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("Snapshot failed: %v", err),
+			NodeId:             s.nodeID,
+			Success:            true,
+			WalPosition:        walPos,
+			SnapshotDurationMs: elapsed,
 		}, nil
 	}
 
-	// Store snapshot metadata locally.
-	snapInfo := &metadata.SnapshotInfo{
-		SnapshotID:  req.SnapshotId,
-		Label:       req.Label,
-		CreatedAt:   time.Now().UnixNano(),
-		InitiatedBy: req.MasterId,
-		WALPosition: walPos,
-		FileCount:   int32(s.fileIndex.Count()),
-		Term:        req.Term,
+	// Subsequent MARKER: we've already recorded our state.
+	// Stop recording on this channel and save the channel state.
+	state.mu.Lock()
+	state.markersReceived[senderID] = true
+	channelMsgs := state.channelState[senderID]
+	allReceived := len(state.markersReceived) >= state.totalPeers
+	state.mu.Unlock()
+
+	if len(channelMsgs) > 0 {
+		log.Printf("[CL-Snapshot %d] Subsequent MARKER from node %d. Channel state: %d messages recorded.",
+			s.nodeID, senderID, len(channelMsgs))
+	} else {
+		log.Printf("[CL-Snapshot %d] Subsequent MARKER from node %d. Channel state: empty (no in-flight messages).",
+			s.nodeID, senderID)
 	}
 
-	log.Printf("[MutEx %d] Acquiring snapshotMu Lock for SnapshotInit commit", s.nodeID)
-	s.snapshotMu.Lock()
-	s.snapshotMeta = append(s.snapshotMeta, snapInfo)
-	s.snapshotMu.Unlock()
-	log.Printf("[MutEx %d] Released snapshotMu Lock for SnapshotInit commit", s.nodeID)
-
-	s.saveSnapshotMetadata()
+	if allReceived {
+		log.Printf("[CL-Snapshot %d] All MARKERs received for snapshot '%s'. Snapshot complete at this node.",
+			s.nodeID, req.SnapshotId)
+		removeCLState(req.SnapshotId)
+	}
 
 	elapsed := time.Since(startTime).Milliseconds()
-	log.Printf("[Snapshot %d] ✅ Local snapshot '%s' complete (%dms)",
-		s.nodeID, req.SnapshotId, elapsed)
-
 	return &filesync.SnapshotInitResponse{
 		NodeId:             s.nodeID,
 		Success:            true,
-		WalPosition:        walPos,
+		WalPosition:        state.walPosition,
 		SnapshotDurationMs: elapsed,
 	}, nil
 }
@@ -292,7 +501,7 @@ func (s *Server) ListSnapshots(ctx context.Context, req *filesync.ListSnapshotsR
 		})
 	}
 
-	log.Printf("[Snapshot %d] ListSnapshots: %d snapshots", s.nodeID, len(protoSnapshots))
+	log.Printf("[CL-Snapshot %d] ListSnapshots: %d snapshots", s.nodeID, len(protoSnapshots))
 
 	return &filesync.ListSnapshotsResponse{
 		Snapshots:  protoSnapshots,
@@ -304,7 +513,7 @@ func (s *Server) ListSnapshots(ctx context.Context, req *filesync.ListSnapshotsR
 
 // ReadSnapshot retrieves the immutable file index from a specific snapshot.
 func (s *Server) ReadSnapshot(ctx context.Context, req *filesync.ReadSnapshotRequest) (*filesync.ReadSnapshotResponse, error) {
-	log.Printf("[Snapshot %d] ReadSnapshot '%s'", s.nodeID, req.SnapshotId)
+	log.Printf("[CL-Snapshot %d] ReadSnapshot '%s'", s.nodeID, req.SnapshotId)
 
 	// Find the snapshot metadata.
 	s.snapshotMu.RLock()
@@ -385,13 +594,13 @@ func (s *Server) saveSnapshotMetadata() {
 
 	data, err := json.MarshalIndent(s.snapshotMeta, "", "  ")
 	if err != nil {
-		log.Printf("[Snapshot %d] Failed to marshal snapshot metadata: %v", s.nodeID, err)
+		log.Printf("[CL-Snapshot %d] Failed to marshal snapshot metadata: %v", s.nodeID, err)
 		return
 	}
 
 	metaFile := filepath.Join(s.dirs.Metadata, "snapshots_meta.json")
 	if err := os.WriteFile(metaFile, data, 0644); err != nil {
-		log.Printf("[Snapshot %d] Failed to write snapshot metadata: %v", s.nodeID, err)
+		log.Printf("[CL-Snapshot %d] Failed to write snapshot metadata: %v", s.nodeID, err)
 	}
 }
 
@@ -401,7 +610,7 @@ func (s *Server) loadSnapshotMetadata() {
 	data, err := os.ReadFile(metaFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("[Snapshot %d] Warning: failed to load snapshot metadata: %v", s.nodeID, err)
+			log.Printf("[CL-Snapshot %d] Warning: failed to load snapshot metadata: %v", s.nodeID, err)
 		}
 		return
 	}
@@ -414,9 +623,9 @@ func (s *Server) loadSnapshotMetadata() {
 	}()
 
 	if err := json.Unmarshal(data, &s.snapshotMeta); err != nil {
-		log.Printf("[Snapshot %d] Warning: failed to parse snapshot metadata: %v", s.nodeID, err)
+		log.Printf("[CL-Snapshot %d] Warning: failed to parse snapshot metadata: %v", s.nodeID, err)
 	} else {
-		log.Printf("[Snapshot %d] Loaded %d snapshot records", s.nodeID, len(s.snapshotMeta))
+		log.Printf("[CL-Snapshot %d] Loaded %d snapshot records", s.nodeID, len(s.snapshotMeta))
 	}
 }
 

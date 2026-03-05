@@ -16,7 +16,7 @@ Communication between nodes uses gRPC over Protocol Buffers. The service definit
 | Mutual Exclusion | Ricart-Agrawala | `ricart_agrawala.go` |
 | Replication | Async Master-to-Follower Streaming | `replication.go` |
 | Checkpointing | Koo-Toueg Coordinated Checkpointing | `checkpoint.go` |
-| Snapshotting | Coordinated Snapshot Protocol | `snapshot.go` |
+| Snapshotting | Chandy-Lamport Distributed Snapshot | `snapshot.go` |
 | Crash Recovery | WAL Replay + Checkpoint Restore | `recovery.go` |
 
 ## Algorithms
@@ -41,9 +41,9 @@ The system performs coordinated checkpoints after a configurable number of write
 
 On startup, each node performs a two-phase recovery. First, it looks for the latest checkpoint file and restores the file index from that snapshot. Second, it replays any uncommitted entries in the write-ahead log that were recorded after the checkpoint. This guarantees that all operations that were committed before a crash are recovered, and partially applied operations are either completed or rolled back.
 
-### Snapshots
+### Snapshots (Chandy-Lamport Algorithm)
 
-Snapshots provide a read-only, point-in-time view of the file index. They are coordinated by the master, which assigns a snapshot ID, broadcasts a SNAPSHOT-INIT request to all followers, and waits for acknowledgments. Each node saves an immutable copy of its current file index along with the WAL position at the time of the snapshot. Snapshots can be listed and read back through the CLI client.
+Snapshots use the Chandy-Lamport algorithm to capture a consistent distributed snapshot of the entire cluster. The initiating node records its own local state (file index and WAL position), then sends a MARKER message to all peers on every outgoing channel. When a node receives a MARKER for the first time, it immediately records its own local state and forwards MARKER messages to all other peers. It also begins recording any messages arriving on channels that have not yet delivered a MARKER, capturing any in-flight operations. When a subsequent MARKER arrives on a channel that is being recorded, the node stops recording on that channel and saves the accumulated messages as the channel state. The snapshot is complete at a node once MARKERs have been received on all incoming channels. The resulting global snapshot consists of each node's local state plus the state of all communication channels, providing a consistent cut across the distributed system. Snapshots can be listed and read back through the CLI client.
 
 ## Project Structure
 

@@ -232,6 +232,11 @@ func (s *Server) ReplicateFile(stream filesync.FileSyncService_ReplicateFileServ
 	}
 
 	// Execute the replicated operation locally.
+	// Record this message for any active Chandy-Lamport snapshots.
+	if filename != "" && operation != "" {
+		s.RecordChannelMessage(0, fmt.Sprintf("REPLICATE %s '%s'", operation, filename))
+	}
+
 	switch operation {
 	case "UPLOAD":
 		// Write file to local disk.
