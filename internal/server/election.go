@@ -283,18 +283,6 @@ func (s *Server) declareVictory(priority int64, electionStart time.Time) {
 	s.masterID.Store(s.nodeID)
 	s.lastHeartbeat.Store(time.Now().UnixNano())
 
-	// 📢 Prominent master IP announcement.
-	masterIP := s.getMasterAddr()
-	log.Printf("")
-	log.Printf("========================================================")
-	log.Printf("  📢 NEW MASTER ELECTED")
-	log.Printf("  Node ID : %d", s.nodeID)
-	log.Printf("  IP Addr : %s", masterIP)
-	log.Printf("  Term    : %d", newTerm)
-	log.Printf("  Priority: %d", priority)
-	log.Printf("========================================================")
-	log.Printf("")
-
 	// Write the master election record to master_log.jsonl.
 	s.recordMasterElection(newTerm)
 

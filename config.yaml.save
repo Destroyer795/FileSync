@@ -55,4 +55,4 @@ peers:
   - id: 3
     address: "localhost:50053"
   - id: 4
-    address: "localh:50054"
+    address: "localhost:50054"

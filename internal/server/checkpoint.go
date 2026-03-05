@@ -39,12 +39,10 @@ import (
 	"github.com/filesync/gen/filesync"
 )
 
-// triggerCheckpoint is called by the master when opsSinceCheckpoint reaches
-// the configured checkpoint_interval. Coordinates a cluster-wide checkpoint.
+// triggerCheckpoint is called when opsSinceCheckpoint reaches the configured
+// checkpoint_interval. Any node can trigger this since writes are distributed
+// via the Ricart-Agrawala algorithm. Coordinates a cluster-wide checkpoint.
 func (s *Server) triggerCheckpoint() {
-	if !s.isMasterNode() {
-		return
-	}
 
 	startTime := time.Now()
 	newCheckpointID := s.checkpointID.Add(1)
