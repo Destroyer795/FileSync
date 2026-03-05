@@ -50,9 +50,9 @@ checkpoint_interval: 500
 # For local testing: use localhost with different ports.
 # For LAN deployment: use the actual IP addresses of each laptop.
 peers:
+  # - id: 2
+  #   address: "10.12.235.187:50051"
   - id: 2
-    address: "10.12.235.187:50051"
-  - id: 3
     address: "10.12.227.43:50051"
-  - id: 4
-    address: "10.12.235.25:50051"
+  # - id: 4
+  #   address: "10.12.235.25:50051"
