@@ -8,6 +8,17 @@ The cluster consists of up to 4 nodes, each running an identical binary with a u
 
 Communication between nodes uses gRPC over Protocol Buffers. The service definition lives in `proto/filesync.proto`, and the generated Go bindings are in `gen/filesync/`.
 
+## Algorithm Summary
+
+| Concern | Algorithm | Implementation |
+|---|---|---|
+| Leader Election | Bully Algorithm | `election.go` |
+| Mutual Exclusion | Ricart-Agrawala | `ricart_agrawala.go` |
+| Replication | Async Master-to-Follower Streaming | `replication.go` |
+| Checkpointing | Koo-Toueg Coordinated Checkpointing | `checkpoint.go` |
+| Snapshotting | Coordinated Snapshot Protocol | `snapshot.go` |
+| Crash Recovery | WAL Replay + Checkpoint Restore | `recovery.go` |
+
 ## Algorithms
 
 ### Leader Election (Bully Algorithm)
