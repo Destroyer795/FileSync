@@ -8,7 +8,7 @@
 //   1. File Operations      — Upload, Download, Delete, ListFiles
 //   2. Snapshot Management   — CreateSnapshot, ListSnapshots, ReadSnapshot
 //   3. Leader Election       — Heartbeat, Election, ElectionVictory (Bully Algorithm)
-//   4. Mutual Exclusion      — ForwardWrite (Centralized Server approach)
+//   4. Mutual Exclusion      — Ricart-Agrawala (distributed CS via MutexRequest/MutexReply)
 //   5. Replication           — ReplicateFile (async master → follower replication)
 //   6. Checkpointing         — CheckpointRequest (Koo-Toueg inspired coordination)
 //
@@ -123,19 +123,25 @@ service FileSyncService {
   rpc ElectionVictory(VictoryRequest) returns (VictoryResponse);
 
   // ---------------------------------------------------------------------------
-  // MUTUAL EXCLUSION (Centralized Server)
+  // MUTUAL EXCLUSION (Ricart-Agrawala Distributed Algorithm)
   // ---------------------------------------------------------------------------
 
   // ForwardWrite is called by follower nodes to forward write operations
-  // (Upload/Delete) to the current master. The master acquires its centralized
-  // write lock, processes the operation atomically (single-threaded serialization),
-  // appends to WAL, and returns the result.
-  //
-  // This ensures all write operations across the cluster are serialized through
-  // a single point, preventing concurrent write conflicts.
+  // (Upload/Delete) to the current master. Kept for backward compatibility.
+  // With Ricart-Agrawala, any node can execute writes directly after
+  // obtaining distributed permission from all peers.
   //
   // Timing: Logs lock acquisition time, WAL append time, total forwarding latency.
   rpc ForwardWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+
+  // MutexRequest is multicast by a node wanting to enter the critical section.
+  // Per Ricart-Agrawala, the receiver either replies immediately (granting
+  // permission) or defers the reply until it exits the CS.
+  rpc MutexRequest(MutexRequestMsg) returns (MutexReplyMsg);
+
+  // MutexReply is sent as an explicit deferred reply to a MutexRequest,
+  // after the holding node exits the critical section.
+  rpc MutexReply(MutexReplyMsg) returns (MutexReplyMsg);
 
   // ---------------------------------------------------------------------------
   // REPLICATION (Async Master → Follower)
@@ -423,7 +429,7 @@ message VictoryResponse {
 }
 
 // =============================================================================
-// MESSAGE DEFINITIONS — MUTUAL EXCLUSION (ForwardWrite)
+// MESSAGE DEFINITIONS — MUTUAL EXCLUSION (Ricart-Agrawala)
 // =============================================================================
 
 // ForwardWriteRequest encapsulates a write operation forwarded from a
@@ -470,6 +476,29 @@ message ForwardWriteResponse {
   // Time spent waiting to acquire the centralized write lock, in milliseconds.
   // Useful for diagnosing contention issues.
   int64 lock_wait_time_ms = 5;
+}
+
+// MutexRequestMsg is sent by a node requesting entry to the critical section
+// via the Ricart-Agrawala distributed mutual exclusion algorithm.
+message MutexRequestMsg {
+  // The node ID requesting CS access.
+  int32 node_id = 1;
+
+  // Lamport logical timestamp when the request was made.
+  int64 timestamp = 2;
+
+  // Current election term for validation.
+  int64 term = 3;
+}
+
+// MutexReplyMsg is sent in response to a MutexRequestMsg, granting permission
+// to enter the critical section.
+message MutexReplyMsg {
+  // The node ID sending the reply.
+  int32 node_id = 1;
+
+  // Lamport logical timestamp of the reply.
+  int64 timestamp = 2;
 }
 
 // =============================================================================

@@ -57,6 +57,8 @@ const (
 	FileSyncService_ReplicateFile_FullMethodName     = "/filesync.FileSyncService/ReplicateFile"
 	FileSyncService_CheckpointRequest_FullMethodName = "/filesync.FileSyncService/CheckpointRequest"
 	FileSyncService_GetLeaderInfo_FullMethodName     = "/filesync.FileSyncService/GetLeaderInfo"
+	FileSyncService_MutexRequest_FullMethodName      = "/filesync.FileSyncService/MutexRequest"
+	FileSyncService_MutexReply_FullMethodName        = "/filesync.FileSyncService/MutexReply"
 )
 
 // FileSyncServiceClient is the client API for FileSyncService service.
@@ -155,6 +157,12 @@ type FileSyncServiceClient interface {
 	CheckpointRequest(ctx context.Context, in *CheckpointReq, opts ...grpc.CallOption) (*CheckpointAck, error)
 	// GetLeaderInfo returns the current leader's IP address, node ID, and term.
 	GetLeaderInfo(ctx context.Context, in *GetLeaderInfoRequest, opts ...grpc.CallOption) (*GetLeaderInfoResponse, error)
+	// MutexRequest is sent by a node requesting entry to the critical section
+	// (Ricart-Agrawala algorithm). All nodes must reply before the requester enters CS.
+	MutexRequest(ctx context.Context, in *MutexRequestMsg, opts ...grpc.CallOption) (*MutexReplyMsg, error)
+	// MutexReply is sent as an explicit deferred reply to a MutexRequest
+	// (used when the reply was deferred and is now being released).
+	MutexReply(ctx context.Context, in *MutexReplyMsg, opts ...grpc.CallOption) (*MutexReplyMsg, error)
 }
 
 type fileSyncServiceClient struct {
@@ -330,6 +338,26 @@ func (c *fileSyncServiceClient) GetLeaderInfo(ctx context.Context, in *GetLeader
 	return out, nil
 }
 
+func (c *fileSyncServiceClient) MutexRequest(ctx context.Context, in *MutexRequestMsg, opts ...grpc.CallOption) (*MutexReplyMsg, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MutexReplyMsg)
+	err := c.cc.Invoke(ctx, FileSyncService_MutexRequest_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fileSyncServiceClient) MutexReply(ctx context.Context, in *MutexReplyMsg, opts ...grpc.CallOption) (*MutexReplyMsg, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MutexReplyMsg)
+	err := c.cc.Invoke(ctx, FileSyncService_MutexReply_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FileSyncServiceServer is the server API for FileSyncService service.
 // All implementations must embed UnimplementedFileSyncServiceServer
 // for forward compatibility.
@@ -426,6 +454,11 @@ type FileSyncServiceServer interface {
 	CheckpointRequest(context.Context, *CheckpointReq) (*CheckpointAck, error)
 	// GetLeaderInfo returns the current leader's IP address, node ID, and term.
 	GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error)
+	// MutexRequest is sent by a node requesting entry to the critical section
+	// (Ricart-Agrawala algorithm). All nodes must reply before the requester enters CS.
+	MutexRequest(context.Context, *MutexRequestMsg) (*MutexReplyMsg, error)
+	// MutexReply is sent as an explicit deferred reply to a MutexRequest.
+	MutexReply(context.Context, *MutexReplyMsg) (*MutexReplyMsg, error)
 	mustEmbedUnimplementedFileSyncServiceServer()
 }
 
@@ -480,6 +513,12 @@ func (UnimplementedFileSyncServiceServer) CheckpointRequest(context.Context, *Ch
 }
 func (UnimplementedFileSyncServiceServer) GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetLeaderInfo not implemented")
+}
+func (UnimplementedFileSyncServiceServer) MutexRequest(context.Context, *MutexRequestMsg) (*MutexReplyMsg, error) {
+	return nil, status.Error(codes.Unimplemented, "method MutexRequest not implemented")
+}
+func (UnimplementedFileSyncServiceServer) MutexReply(context.Context, *MutexReplyMsg) (*MutexReplyMsg, error) {
+	return nil, status.Error(codes.Unimplemented, "method MutexReply not implemented")
 }
 func (UnimplementedFileSyncServiceServer) mustEmbedUnimplementedFileSyncServiceServer() {}
 func (UnimplementedFileSyncServiceServer) testEmbeddedByValue()                         {}
@@ -743,6 +782,42 @@ func _FileSyncService_GetLeaderInfo_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FileSyncService_MutexRequest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MutexRequestMsg)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FileSyncServiceServer).MutexRequest(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FileSyncService_MutexRequest_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FileSyncServiceServer).MutexRequest(ctx, req.(*MutexRequestMsg))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FileSyncService_MutexReply_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MutexReplyMsg)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FileSyncServiceServer).MutexReply(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FileSyncService_MutexReply_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FileSyncServiceServer).MutexReply(ctx, req.(*MutexReplyMsg))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FileSyncService_ServiceDesc is the grpc.ServiceDesc for FileSyncService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -797,6 +872,14 @@ var FileSyncService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLeaderInfo",
 			Handler:    _FileSyncService_GetLeaderInfo_Handler,
+		},
+		{
+			MethodName: "MutexRequest",
+			Handler:    _FileSyncService_MutexRequest_Handler,
+		},
+		{
+			MethodName: "MutexReply",
+			Handler:    _FileSyncService_MutexReply_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

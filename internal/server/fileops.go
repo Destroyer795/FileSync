@@ -5,19 +5,21 @@
 // Implements the gRPC handlers for all file operations:
 //
 // WRITES (Upload, Delete):
-//   - If this node is the master: acquire the centralized write lock (writeMu),
-//     append to WAL, execute the operation, mark WAL committed, trigger
-//     async replication, and check if a checkpoint is needed.
-//   - If this node is a follower: forward the write request to the master
-//     via the ForwardWrite RPC (centralized mutual exclusion pattern).
+//   - Any node can execute writes by first entering the critical section
+//     using the Ricart-Agrawala distributed mutual exclusion algorithm.
+//   - The requesting node multicasts REQUEST to all peers, waits for REPLY
+//     from all, then enters CS to: append to WAL, execute the operation,
+//     mark WAL committed, and trigger async replication.
+//   - ForwardWrite is kept for backward compatibility but writes can now
+//     be executed on any node.
 //
 // READS (Download, ListFiles):
-//   - Served locally from any node's replica — no master coordination needed.
+//   - Served locally from any node's replica — no coordination needed.
 //   - Target: < 5ms latency for local reads.
 //
-// The master's writeMu (sync.Mutex) is the centralized lock that serializes
-// ALL write operations across the cluster, implementing the "Centralized
-// Server" mutual exclusion algorithm.
+// The Ricart-Agrawala algorithm ensures that only ONE node in the cluster
+// can be inside the critical section at any time, providing distributed
+// mutual exclusion without a centralized lock.
 // =============================================================================
 
 package server
@@ -85,65 +87,44 @@ func (s *Server) Upload(stream filesync.FileSyncService_UploadServer) error {
 	log.Printf("[FileOps %d] Received file '%s' (%d bytes) from node %d",
 		s.nodeID, filename, len(fileData), sourceNodeID)
 
-	// If we are the master, process the write locally.
-	if s.isMasterNode() {
-		version, err := s.executeUpload(filename, fileData)
-		elapsed := time.Since(startTime).Milliseconds()
-		if err != nil {
-			log.Printf("[FileOps %d] Upload failed for '%s': %v", s.nodeID, filename, err)
-			return stream.SendAndClose(&filesync.UploadResponse{
-				Success:          false,
-				Message:          fmt.Sprintf("Upload failed: %v", err),
-				ProcessingTimeMs: elapsed,
-			})
-		}
-		log.Printf("[FileOps %d] ✅ Upload complete: '%s' v%d (%dms)",
-			s.nodeID, filename, version, elapsed)
-		return stream.SendAndClose(&filesync.UploadResponse{
-			Success:          true,
-			Message:          fmt.Sprintf("File '%s' uploaded successfully (v%d)", filename, version),
-			Version:          version,
-			ProcessingTimeMs: elapsed,
-		})
-	}
-
-	// We are a follower — forward to master via ForwardWrite.
-	log.Printf("[FileOps %d] Forwarding upload of '%s' to master %d",
-		s.nodeID, filename, s.getMasterID())
-
-	resp, err := s.forwardWriteToMaster("UPLOAD", filename, fileData)
+	// With Ricart-Agrawala, any node can execute writes locally.
+	// Enter the distributed critical section first.
+	version, err := s.executeUpload(filename, fileData)
 	elapsed := time.Since(startTime).Milliseconds()
 	if err != nil {
+		log.Printf("[FileOps %d] Upload failed for '%s': %v", s.nodeID, filename, err)
 		return stream.SendAndClose(&filesync.UploadResponse{
 			Success:          false,
-			Message:          fmt.Sprintf("Forward to master failed: %v", err),
+			Message:          fmt.Sprintf("Upload failed: %v", err),
 			ProcessingTimeMs: elapsed,
 		})
 	}
-
+	log.Printf("[FileOps %d] ✅ Upload complete: '%s' v%d (%dms)",
+		s.nodeID, filename, version, elapsed)
 	return stream.SendAndClose(&filesync.UploadResponse{
-		Success:          resp.Success,
-		Message:          resp.Message,
-		Version:          resp.Version,
+		Success:          true,
+		Message:          fmt.Sprintf("File '%s' uploaded successfully (v%d)", filename, version),
+		Version:          version,
 		ProcessingTimeMs: elapsed,
 	})
 }
 
-// executeUpload is the master's internal upload handler.
-// Acquires the centralized write lock, appends to WAL, writes to disk,
-// updates the file index, and triggers async replication.
+// executeUpload is the write handler for uploads.
+// Uses Ricart-Agrawala to enter the distributed critical section,
+// then appends to WAL, writes to disk, updates index, and replicates.
 func (s *Server) executeUpload(filename string, data []byte) (int64, error) {
-	// Step 1: Acquire the centralized write lock.
-	// This is the Centralized Server mutual exclusion — single-threaded writes.
-	log.Printf("[MutEx %d] Acquiring writeMu for UPLOAD '%s'", s.nodeID, filename)
+	// Step 1: Enter the distributed critical section (Ricart-Agrawala).
+	log.Printf("[R-A %d] Requesting CS for UPLOAD '%s'", s.nodeID, filename)
 	lockStart := time.Now()
-	s.writeMu.Lock()
+	if err := s.requestCriticalSection(); err != nil {
+		return 0, fmt.Errorf("failed to enter critical section: %w", err)
+	}
 	defer func() {
-		s.writeMu.Unlock()
-		log.Printf("[MutEx %d] Released writeMu for UPLOAD '%s'", s.nodeID, filename)
+		s.releaseCriticalSection()
+		log.Printf("[R-A %d] Released CS for UPLOAD '%s'", s.nodeID, filename)
 	}()
 	lockWait := time.Since(lockStart)
-	log.Printf("[MutEx %d] writeMu acquired for UPLOAD '%s' (waited %v)",
+	log.Printf("[R-A %d] CS acquired for UPLOAD '%s' (waited %v)",
 		s.nodeID, filename, lockWait)
 
 	// Step 2: Determine the new version number.
@@ -265,57 +246,41 @@ func (s *Server) Download(req *filesync.DownloadRequest, stream filesync.FileSyn
 
 // ----------- Delete Handler -----------
 
-// Delete removes a file from the cluster. Write operation — follows the
-// centralized mutex path (forwarded to master if called on a follower).
+// Delete removes a file from the cluster. Write operation — uses
+// Ricart-Agrawala distributed mutual exclusion (any node can execute).
 func (s *Server) Delete(ctx context.Context, req *filesync.DeleteRequest) (*filesync.DeleteResponse, error) {
 	startTime := time.Now()
 	log.Printf("[FileOps %d] Delete request for '%s' from node %d",
 		s.nodeID, req.Filename, req.SourceNodeId)
 
-	// If we are the master, process locally.
-	if s.isMasterNode() {
-		err := s.executeDelete(req.Filename)
-		elapsed := time.Since(startTime).Milliseconds()
-		if err != nil {
-			return &filesync.DeleteResponse{
-				Success:          false,
-				Message:          fmt.Sprintf("Delete failed: %v", err),
-				ProcessingTimeMs: elapsed,
-			}, nil
-		}
-		return &filesync.DeleteResponse{
-			Success:          true,
-			Message:          fmt.Sprintf("File '%s' deleted successfully", req.Filename),
-			ProcessingTimeMs: elapsed,
-		}, nil
-	}
-
-	// Forward to master.
-	resp, err := s.forwardWriteToMaster("DELETE", req.Filename, nil)
+	// With Ricart-Agrawala, any node can execute writes locally.
+	err := s.executeDelete(req.Filename)
 	elapsed := time.Since(startTime).Milliseconds()
 	if err != nil {
 		return &filesync.DeleteResponse{
 			Success:          false,
-			Message:          fmt.Sprintf("Forward to master failed: %v", err),
+			Message:          fmt.Sprintf("Delete failed: %v", err),
 			ProcessingTimeMs: elapsed,
 		}, nil
 	}
-
 	return &filesync.DeleteResponse{
-		Success:          resp.Success,
-		Message:          resp.Message,
+		Success:          true,
+		Message:          fmt.Sprintf("File '%s' deleted successfully", req.Filename),
 		ProcessingTimeMs: elapsed,
 	}, nil
 }
 
-// executeDelete is the master's internal delete handler.
+// executeDelete is the delete handler.
+// Uses Ricart-Agrawala to enter the distributed critical section.
 func (s *Server) executeDelete(filename string) error {
-	// Acquire the centralized write lock.
-	log.Printf("[MutEx %d] Acquiring writeMu for DELETE '%s'", s.nodeID, filename)
-	s.writeMu.Lock()
+	// Enter the distributed critical section (Ricart-Agrawala).
+	log.Printf("[R-A %d] Requesting CS for DELETE '%s'", s.nodeID, filename)
+	if err := s.requestCriticalSection(); err != nil {
+		return fmt.Errorf("failed to enter critical section: %w", err)
+	}
 	defer func() {
-		s.writeMu.Unlock()
-		log.Printf("[MutEx %d] Released writeMu for DELETE '%s'", s.nodeID, filename)
+		s.releaseCriticalSection()
+		log.Printf("[R-A %d] Released CS for DELETE '%s'", s.nodeID, filename)
 	}()
 
 	// Check if file exists.

@@ -105,12 +105,12 @@ type Server struct {
 	// Whether an election is currently in progress (prevents duplicate elections).
 	electionInProgress atomic.Bool
 
-	// ----------- Centralized Mutual Exclusion -----------
+	// ----------- Distributed Mutual Exclusion (Ricart-Agrawala) -----------
 
-	// The master's write lock. Only the master acquires this.
-	// All write operations (Upload, Delete) are serialized through this mutex.
-	// This implements the "Centralized Server" mutual exclusion algorithm.
-	writeMu sync.Mutex
+	// Ricart-Agrawala state machine for distributed critical section access.
+	// Any node can request CS by multicasting REQUEST to all peers and
+	// waiting for all REPLY messages before entering.
+	ra *RAState
 
 	// Master log mutex. Only the master acquires this to write
 	// leadership election records to master_log.jsonl.
@@ -171,6 +171,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		peerPriorities: make(map[int32]int64),
 		fileIndex:      metadata.NewFileIndex(),
 		wal:            walInstance,
+		ra:             NewRAState(len(cfg.Peers)),
 		cfg:            cfg,
 		dirs:           dirs,
 		ctx:            ctx,
