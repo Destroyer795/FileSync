@@ -1,3 +1,6 @@
 {"master_node_id":1,"master_ip":"localhost:50051","term":2,"timestamp":"2026-03-05T10:48:36+05:30","written_by":1,"event":"ELECTED"}
 {"master_node_id":1,"master_ip":"localhost:50051","term":2,"timestamp":"2026-03-05T11:36:02+05:30","written_by":1,"event":"ELECTED"}
 {"master_node_id":1,"master_ip":"localhost:50051","term":1,"timestamp":"2026-03-05T11:37:01+05:30","written_by":1,"event":"ELECTED"}
+{"master_node_id":1,"master_ip":"localhost:50051","term":1,"timestamp":"2026-03-05T11:44:08+05:30","written_by":1,"event":"ELECTED"}
+{"master_node_id":1,"master_ip":"localhost:50051","term":2,"timestamp":"2026-03-05T11:44:09+05:30","written_by":1,"event":"ELECTED"}
+{"master_node_id":1,"master_ip":"localhost:50051","term":3,"timestamp":"2026-03-05T11:46:14+05:30","written_by":1,"event":"ELECTED"}
