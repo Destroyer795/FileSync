@@ -112,6 +112,10 @@ type Server struct {
 	// This implements the "Centralized Server" mutual exclusion algorithm.
 	writeMu sync.Mutex
 
+	// Master log mutex. Only the master acquires this to write
+	// leadership election records to master_log.jsonl.
+	masterLogMu sync.Mutex
+
 	// ----------- Configuration -----------
 
 	// Loaded configuration from config.yaml.

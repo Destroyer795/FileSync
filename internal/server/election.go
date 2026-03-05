@@ -130,8 +130,16 @@ func (s *Server) ElectionVictory(ctx context.Context, req *filesync.VictoryReque
 		log.Printf("[Election %d] I am the new master (term %d)", s.nodeID, req.Term)
 	} else {
 		s.isMaster.Store(false)
-		log.Printf("[Election %d] ✅ Accepted node %d as new master (term %d)",
-			s.nodeID, req.NewMasterId, req.Term)
+		// Look up the new master's IP for the log.
+		masterIP := ""
+		if addr, ok := s.peerAddrs[req.NewMasterId]; ok {
+			masterIP = addr
+		}
+		log.Printf("[Election %d] ✅ Accepted node %d (IP: %s) as new master (term %d)",
+			s.nodeID, req.NewMasterId, masterIP, req.Term)
+
+		// Record the leadership change in our local master log.
+		s.writeRemoteMasterLogEntry(req.NewMasterId, req.Term)
 	}
 
 	return &filesync.VictoryResponse{
@@ -275,6 +283,21 @@ func (s *Server) declareVictory(priority int64, electionStart time.Time) {
 	s.masterID.Store(s.nodeID)
 	s.lastHeartbeat.Store(time.Now().UnixNano())
 
+	// 📢 Prominent master IP announcement.
+	masterIP := s.getMasterAddr()
+	log.Printf("")
+	log.Printf("========================================================")
+	log.Printf("  📢 NEW MASTER ELECTED")
+	log.Printf("  Node ID : %d", s.nodeID)
+	log.Printf("  IP Addr : %s", masterIP)
+	log.Printf("  Term    : %d", newTerm)
+	log.Printf("  Priority: %d", priority)
+	log.Printf("========================================================")
+	log.Printf("")
+
+	// Write the master election record to master_log.jsonl.
+	s.recordMasterElection(newTerm)
+
 	// Broadcast COORDINATOR to all peers.
 	allPeers := s.getAllPeerIDs()
 	var wg sync.WaitGroup
@@ -310,8 +333,8 @@ func (s *Server) declareVictory(priority int64, electionStart time.Time) {
 	}
 
 	wg.Wait()
-	log.Printf("[Election %d] Victory broadcast complete. Starting heartbeat loop. Master IP: %s",
-		s.nodeID, s.getMasterAddr())
+	log.Printf("[Election %d] Victory broadcast complete. Starting heartbeat loop.",
+		s.nodeID)
 
 	// Start broadcasting heartbeats as the new master.
 	go s.heartbeatBroadcastLoop()
@@ -414,16 +437,25 @@ func (s *Server) heartbeatMonitorLoop() {
 			elapsed := time.Since(lastHB)
 
 			if elapsed > s.cfg.HeartbeatTimeout() {
-				log.Printf("[Heartbeat %d] ⚠️ Master heartbeat timeout! Last heartbeat %v ago (threshold: %v). Initiating election.",
-					s.nodeID, elapsed, s.cfg.HeartbeatTimeout())
-
-				// Invalidate the connection to the old master so we reconnect
-				// when a new one is elected.
 				oldMaster := s.getMasterID()
+				oldMasterAddr := s.getMasterAddr()
+				log.Printf("[Heartbeat %d] ⚠️ Master heartbeat timeout! Master was node %d (IP: %s). Last heartbeat %v ago (threshold: %v). Initiating re-election.",
+					s.nodeID, oldMaster, oldMasterAddr, elapsed, s.cfg.HeartbeatTimeout())
+
+				// Invalidate the connection to the old master.
 				s.invalidatePeerConnection(oldMaster)
+
+				// Clear the master ID so we don't skip monitoring while
+				// the election is in progress. This forces the node to
+				// know there is NO master until a new one is elected.
+				s.masterID.Store(0)
+				s.isMaster.Store(false)
 
 				// Reset the heartbeat timer to prevent rapid-fire elections.
 				s.lastHeartbeat.Store(time.Now().UnixNano())
+
+				log.Printf("[Heartbeat %d] 🔄 Starting re-election after master %d (IP: %s) became unreachable",
+					s.nodeID, oldMaster, oldMasterAddr)
 
 				go s.startElection()
 			}

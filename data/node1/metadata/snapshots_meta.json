@@ -20,5 +20,47 @@
     "total_size_bytes": 0,
     "term": 4,
     "participating_nodes": null
+  },
+  {
+    "snapshot_id": "snap_1772687205_1",
+    "label": "huh",
+    "created_at": 1772687205463848782,
+    "initiated_by": 1,
+    "wal_position": 7,
+    "file_count": 2,
+    "total_size_bytes": 30,
+    "term": 4,
+    "participating_nodes": [
+      1,
+      2
+    ]
+  },
+  {
+    "snapshot_id": "snap_1772687262_1",
+    "label": "pre-deploy",
+    "created_at": 1772687262269401233,
+    "initiated_by": 1,
+    "wal_position": 7,
+    "file_count": 2,
+    "total_size_bytes": 30,
+    "term": 4,
+    "participating_nodes": [
+      1,
+      2
+    ]
+  },
+  {
+    "snapshot_id": "snap_1772687315_1",
+    "label": "huh",
+    "created_at": 1772687315078173290,
+    "initiated_by": 1,
+    "wal_position": 7,
+    "file_count": 2,
+    "total_size_bytes": 30,
+    "term": 4,
+    "participating_nodes": [
+      1,
+      2
+    ]
   }
 ]
